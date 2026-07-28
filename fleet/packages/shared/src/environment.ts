@@ -69,3 +69,91 @@ export const PulledImage = Schema.Struct({
   digest: Schema.NullOr(Schema.String),
 });
 export type PulledImage = typeof PulledImage.Type;
+
+// --- controller-side environment model (phase 3) -----------------------------
+
+/** What the operator wants: the environment exists and serves, or is gone. */
+export const EnvironmentDesiredState = Schema.Literals(["running", "destroyed"]);
+export type EnvironmentDesiredState = typeof EnvironmentDesiredState.Type;
+
+/**
+ * Persisted progress of the create step machine. Steps are re-runnable: a
+ * controller restarted mid-create resumes from the recorded step and
+ * converges (driver create/start are idempotent, health polling is a read,
+ * session issue revokes stale controller sessions before issuing).
+ */
+export const EnvironmentCreateStep = Schema.Literals([
+  "scheduled",
+  "image-ready",
+  "created",
+  "started",
+  "healthy",
+  "session-issued",
+  "ready",
+]);
+export type EnvironmentCreateStep = typeof EnvironmentCreateStep.Type;
+
+/** What the controller last observed about the environment. */
+export const EnvironmentObservedState = Schema.Literals([
+  "creating",
+  "running",
+  "unreachable",
+  "error",
+  "destroying",
+  "destroyed",
+]);
+export type EnvironmentObservedState = typeof EnvironmentObservedState.Type;
+
+/**
+ * Activity summary derived from `GET /api/orchestration/snapshot`, persisted
+ * with every status poll. Deliberately carries enough for phase 7's idle
+ * predicate: a turn currently running and the moment anything last changed.
+ */
+export const EnvironmentActivity = Schema.Struct({
+  threadCount: Schema.Int,
+  /** Threads whose latest turn is in state `running`. */
+  runningTurnCount: Schema.Int,
+  /** ISO timestamp of the most recently updated thread, if any. */
+  lastThreadUpdatedAt: Schema.NullOr(Schema.String),
+  /** ISO timestamp of the snapshot itself (`OrchestrationReadModel.updatedAt`). */
+  snapshotUpdatedAt: Schema.String,
+});
+export type EnvironmentActivity = typeof EnvironmentActivity.Type;
+
+/**
+ * The environment as served by the controller's inventory API
+ * (`GET /api/environments`); the phase-6 dashboard consumes this shape.
+ * Never carries secrets — the T3 admin session lives in the vault.
+ */
+export const EnvironmentSummary = Schema.Struct({
+  id: Schema.String,
+  name: Schema.String,
+  nodeId: Schema.String,
+  gitUrl: Schema.String,
+  gitBranch: Schema.NullOr(Schema.String),
+  imageReference: Schema.String,
+  desiredState: EnvironmentDesiredState,
+  createStep: EnvironmentCreateStep,
+  observedState: EnvironmentObservedState,
+  /**
+   * Base URL clients reach the T3 server at. Node-port (`http://host:port`)
+   * in phase 3; phase 4 swaps in the tailnet HTTPS URL.
+   */
+  endpointUrl: Schema.NullOr(Schema.String),
+  /** The T3 server's own environment id, from the descriptor endpoint. */
+  t3EnvironmentId: Schema.NullOr(Schema.String),
+  activity: Schema.NullOr(EnvironmentActivity),
+  lastStatusAtMillis: Schema.NullOr(Schema.Number),
+  error: Schema.NullOr(Schema.String),
+  createdAtMillis: Schema.Number,
+  updatedAtMillis: Schema.Number,
+});
+export type EnvironmentSummary = typeof EnvironmentSummary.Type;
+
+/** A minted one-time pairing link. Returned once, never stored. */
+export const PairingLink = Schema.Struct({
+  /** Ready-to-open `<endpoint>/pair#token=...` URL. */
+  url: Schema.String,
+  expiresAt: Schema.String,
+});
+export type PairingLink = typeof PairingLink.Type;

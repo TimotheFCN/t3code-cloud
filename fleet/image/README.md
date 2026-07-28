@@ -48,18 +48,30 @@ The inner Docker data root deliberately lives on the volume (a real host filesys
 persists inner images/containers and sidesteps overlayfs-on-overlayfs; sysbox's special handling
 of `/var/lib/docker` is not needed.
 
-## Entrypoint (phase-2 minimal)
+## Entrypoint (phase-3 bootstrap)
 
-`entrypoint.sh` starts the inner `dockerd` (waits up to 30s for the socket; warns and continues
-without it when the runtime cannot support it, e.g. plain `runc` in development), then runs
-`t3 serve` configured purely through `T3CODE_*` env vars. Image defaults:
+`entrypoint.sh` runs the bootstrap sequence on every container boot:
+
+1. Start the inner `dockerd` (waits up to 30s for the socket; warns and continues without it when
+   the runtime cannot support it, e.g. plain `runc` in development). `T3ENV_SKIP_DOCKERD=1` skips
+   it (useful in tests).
+2. Clone `T3ENV_GIT_URL` (optionally `--branch T3ENV_GIT_BRANCH`) into `/root/workspace` — only
+   when the volume does not already contain a clone, so recreates and restarts never touch an
+   existing workspace.
+3. Run the **setup hook** when the repo defines one: an executable `.t3env/setup.sh` at the repo
+   root, executed from the workspace on every boot. It must be idempotent; this is where projects
+   reinstall apt packages and other root-filesystem state that image updates legitimately lose. A
+   failing hook aborts the boot loudly.
+4. `t3 project add /root/workspace` (an already-registered workspace counts as success —
+   `T3CODE_HOME` lives on the volume).
+5. `t3 serve`, configured purely through `T3CODE_*` env vars. Image defaults:
 
 ```text
 T3CODE_HOST=0.0.0.0  T3CODE_PORT=3773  T3CODE_HOME=/root/.t3  T3CODE_NO_BROWSER=1
 ```
 
-`T3ENV_SKIP_DOCKERD=1` skips the inner daemon (useful in tests). Later phases extend the
-bootstrap sequence (tailnet join, credentials, clone, setup hook, `t3 project add`).
+Steps 2–4 are skipped entirely when `T3ENV_GIT_URL` is unset. Phase 4 prepends the tailnet join;
+phase 5 adds credential materialization before the clone.
 
 ## Building and pushing
 

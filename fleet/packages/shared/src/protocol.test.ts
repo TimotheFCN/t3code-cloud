@@ -36,6 +36,13 @@ describe("protocol envelope", () => {
           nodeName: "node-a",
           auth: { method: "credential", nodeId: "node-1", credential: "fnc_test" },
         },
+        {
+          kind: "hello",
+          protocolVersion: PROTOCOL_VERSION,
+          nodeName: "node-a",
+          endpointHost: "10.0.0.7",
+          auth: { method: "credential", nodeId: "node-1", credential: "fnc_test" },
+        },
         { kind: "event", type: "heartbeat", payload: capacity },
         { kind: "res", id: "r1", ok: true, payload: { pong: true } },
         { kind: "res", id: "r2", ok: false, error: { code: "driver-error", message: "boom" } },

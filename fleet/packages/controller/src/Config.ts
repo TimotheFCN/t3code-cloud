@@ -23,6 +23,10 @@ export interface ControllerConfigShape {
   readonly heartbeatIntervalMillis: number;
   /** Default TTL for minted join tokens when the API caller passes none. */
   readonly joinTokenTtlSeconds: number;
+  /** Interval between environment status polls (descriptor + snapshot). */
+  readonly statusPollIntervalMillis: number;
+  /** How long a create waits for the T3 server to answer its descriptor. */
+  readonly environmentHealthTimeoutMillis: number;
 }
 
 export const defaults: ControllerConfigShape = {
@@ -31,6 +35,8 @@ export const defaults: ControllerConfigShape = {
   dataDir: "./.data/controller",
   heartbeatIntervalMillis: 10_000,
   joinTokenTtlSeconds: 900,
+  statusPollIntervalMillis: 15_000,
+  environmentHealthTimeoutMillis: 180_000,
 };
 
 const ConfigFile = Schema.Struct({
@@ -39,6 +45,8 @@ const ConfigFile = Schema.Struct({
   dataDir: Schema.optional(Schema.String),
   heartbeatIntervalMillis: Schema.optional(Schema.Int),
   joinTokenTtlSeconds: Schema.optional(Schema.Int),
+  statusPollIntervalMillis: Schema.optional(Schema.Int),
+  environmentHealthTimeoutMillis: Schema.optional(Schema.Int),
 });
 
 const decodeConfigFile = Schema.decodeUnknownEffect(Schema.fromJsonString(ConfigFile));
@@ -84,6 +92,12 @@ export class ControllerConfig extends Context.Service<ControllerConfig, Controll
         joinTokenTtlSeconds: yield* Config.int("FLEET_CONTROLLER_JOIN_TOKEN_TTL_SECONDS").pipe(
           Config.option,
         ),
+        statusPollIntervalMillis: yield* Config.int(
+          "FLEET_CONTROLLER_STATUS_POLL_INTERVAL_MS",
+        ).pipe(Config.option),
+        environmentHealthTimeoutMillis: yield* Config.int(
+          "FLEET_CONTROLLER_ENVIRONMENT_HEALTH_TIMEOUT_MS",
+        ).pipe(Config.option),
       };
       return ControllerConfig.of({
         host: Option.getOrElse(env.host, () => fromFile.host ?? defaults.host),
@@ -96,6 +110,14 @@ export class ControllerConfig extends Context.Service<ControllerConfig, Controll
         joinTokenTtlSeconds: Option.getOrElse(
           env.joinTokenTtlSeconds,
           () => fromFile.joinTokenTtlSeconds ?? defaults.joinTokenTtlSeconds,
+        ),
+        statusPollIntervalMillis: Option.getOrElse(
+          env.statusPollIntervalMillis,
+          () => fromFile.statusPollIntervalMillis ?? defaults.statusPollIntervalMillis,
+        ),
+        environmentHealthTimeoutMillis: Option.getOrElse(
+          env.environmentHealthTimeoutMillis,
+          () => fromFile.environmentHealthTimeoutMillis ?? defaults.environmentHealthTimeoutMillis,
         ),
       });
     }),

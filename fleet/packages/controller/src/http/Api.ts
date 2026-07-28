@@ -1,3 +1,4 @@
+import { EnvironmentSummary, PairingLink } from "@t3fleet/shared/environment";
 import { ImagePullResult, ImageSummary } from "@t3fleet/shared/image";
 import { NodeSummary } from "@t3fleet/shared/node";
 import * as Effect from "effect/Effect";
@@ -12,6 +13,14 @@ import {
   HttpApiSchema,
 } from "effect/unstable/httpapi";
 
+import { Environments, NoCurrentImageError } from "../environments/Environments.ts";
+import { EnvironmentRecordNotFoundError } from "../environments/EnvironmentsRepo.ts";
+import {
+  EnvironmentNotReadyError,
+  PairingLinks,
+  PairingMintError,
+} from "../environments/PairingLinks.ts";
+import { NoSchedulableNodeError } from "../environments/Scheduler.ts";
 import { ImageAlreadyExistsError, ImageNotFoundError, Images } from "../images/Images.ts";
 import { ImagePulls } from "../images/ImagePulls.ts";
 import { JoinTokens } from "../nodes/JoinTokens.ts";
@@ -72,11 +81,55 @@ const ImagesGroup = HttpApiGroup.make("images").add(
   }),
 );
 
+const EnvironmentNotFound = EnvironmentRecordNotFoundError.pipe(HttpApiSchema.status(404));
+const EnvironmentNotReady = EnvironmentNotReadyError.pipe(HttpApiSchema.status(409));
+const PairingMintFailed = PairingMintError.pipe(HttpApiSchema.status(502));
+const NoSchedulableNode = NoSchedulableNodeError.pipe(HttpApiSchema.status(409));
+const NoCurrentImage = NoCurrentImageError.pipe(HttpApiSchema.status(409));
+
+const EnvironmentsGroup = HttpApiGroup.make("environments").add(
+  HttpApiEndpoint.get("list", "/api/environments", {
+    success: Schema.Array(EnvironmentSummary),
+  }),
+  // Returns immediately with the persisted record; the create step machine
+  // continues in the background — poll `GET /api/environments/:id`.
+  HttpApiEndpoint.post("create", "/api/environments", {
+    payload: Schema.Struct({
+      gitUrl: Schema.String,
+      gitBranch: Schema.optional(Schema.String),
+      nodeId: Schema.optional(Schema.String),
+      name: Schema.optional(Schema.String),
+    }),
+    success: EnvironmentSummary,
+    error: [NoSchedulableNode, NoCurrentImage],
+  }),
+  HttpApiEndpoint.get("get", "/api/environments/:id", {
+    params: { id: Schema.String },
+    success: EnvironmentSummary,
+    error: EnvironmentNotFound,
+  }),
+  HttpApiEndpoint.post("pairingLink", "/api/environments/:id/pairing-link", {
+    params: { id: Schema.String },
+    success: PairingLink,
+    error: [EnvironmentNotFound, EnvironmentNotReady, PairingMintFailed],
+  }),
+  HttpApiEndpoint.post("destroy", "/api/environments/:id/destroy", {
+    params: { id: Schema.String },
+    payload: Schema.Struct({
+      /** Archive uncommitted work into controller storage before destroying. */
+      archive: Schema.optional(Schema.Boolean),
+    }),
+    success: EnvironmentSummary,
+    error: EnvironmentNotFound,
+  }),
+);
+
 export class FleetApi extends HttpApi.make("fleet")
   .add(SystemGroup)
   .add(NodesGroup)
   .add(JoinTokensGroup)
-  .add(ImagesGroup) {}
+  .add(ImagesGroup)
+  .add(EnvironmentsGroup) {}
 
 const SystemHandlers = HttpApiBuilder.group(
   FleetApi,
@@ -129,7 +182,37 @@ const ImagesHandlers = HttpApiBuilder.group(
   }),
 );
 
-/** All HTTP API routes (health, node inventory, join tokens, images). */
+const EnvironmentsHandlers = HttpApiBuilder.group(
+  FleetApi,
+  "environments",
+  Effect.fn(function* (handlers) {
+    const environments = yield* Environments;
+    const pairingLinks = yield* PairingLinks;
+    return handlers
+      .handle("list", () => environments.list)
+      .handle("create", ({ payload }) =>
+        environments.create({
+          gitUrl: payload.gitUrl,
+          gitBranch: payload.gitBranch,
+          nodeId: payload.nodeId,
+          name: payload.name,
+        }),
+      )
+      .handle("get", ({ params }) => environments.get(params.id))
+      .handle("pairingLink", ({ params }) => pairingLinks.mint(params.id))
+      .handle("destroy", ({ params, payload }) =>
+        environments.destroy(params.id, { archive: payload.archive }),
+      );
+  }),
+);
+
+/** All HTTP API routes (health, nodes, join tokens, images, environments). */
 export const layer = HttpApiBuilder.layer(FleetApi).pipe(
-  Layer.provide([SystemHandlers, NodesHandlers, JoinTokensHandlers, ImagesHandlers]),
+  Layer.provide([
+    SystemHandlers,
+    NodesHandlers,
+    JoinTokensHandlers,
+    ImagesHandlers,
+    EnvironmentsHandlers,
+  ]),
 );

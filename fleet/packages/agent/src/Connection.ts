@@ -72,13 +72,18 @@ export const run = Effect.gen(function* () {
   const driver = yield* Driver;
   const wsUrl = agentSocketUrl(config.controllerUrl);
 
+  const helloBase = {
+    kind: "hello",
+    protocolVersion: PROTOCOL_VERSION,
+    nodeName: config.nodeName,
+    ...(Option.isSome(config.advertiseHost) ? { endpointHost: config.advertiseHost.value } : {}),
+  } as const;
+
   const buildHello = Effect.gen(function* () {
     const stored = yield* store.load;
     if (Option.isSome(stored)) {
       const hello: AgentHello = {
-        kind: "hello",
-        protocolVersion: PROTOCOL_VERSION,
-        nodeName: config.nodeName,
+        ...helloBase,
         auth: {
           method: "credential",
           nodeId: stored.value.nodeId,
@@ -89,9 +94,7 @@ export const run = Effect.gen(function* () {
     }
     if (Option.isSome(config.joinToken)) {
       const hello: AgentHello = {
-        kind: "hello",
-        protocolVersion: PROTOCOL_VERSION,
-        nodeName: config.nodeName,
+        ...helloBase,
         auth: { method: "join-token", joinToken: Redacted.value(config.joinToken.value) },
       };
       return hello;

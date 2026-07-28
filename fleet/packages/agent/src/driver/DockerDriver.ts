@@ -283,7 +283,25 @@ export const layer = Layer.effect(
     });
 
     const pullImage = Effect.fn("DockerDriver.pullImage")(function* (reference: string) {
-      yield* docker("pullImage", ["pull", "--quiet", reference]);
+      const pulled = yield* runDocker("pullImage", ["pull", "--quiet", reference]);
+      if (pulled.exitCode !== 0) {
+        // A failed pull is tolerated when the image is already present
+        // locally: an unreachable registry must not block creates on nodes
+        // that have the image cached (and locally built images are never
+        // pullable at all).
+        const local = yield* runDocker("pullImage", ["image", "inspect", reference]);
+        if (local.exitCode !== 0) {
+          return yield* new DriverError({
+            operation: "pullImage",
+            message:
+              `docker pull ${reference} exited with code ${pulled.exitCode}: ` +
+              pulled.stderr.trim(),
+          });
+        }
+        yield* Effect.logWarning(
+          `pullImage: pull of ${reference} failed but a local copy exists — using it`,
+        );
+      }
       const output = yield* docker("pullImage", [
         "image",
         "inspect",

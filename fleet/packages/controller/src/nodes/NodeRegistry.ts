@@ -7,6 +7,7 @@ import * as Clock from "effect/Clock";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
 import * as Redacted from "effect/Redacted";
 import * as Schema from "effect/Schema";
 import * as SubscriptionRef from "effect/SubscriptionRef";
@@ -60,6 +61,16 @@ export class NodeRegistry extends Context.Service<
       readonly nodeId: string;
       readonly capacity: CapacitySnapshot;
     }) => Effect.Effect<void>;
+    /**
+     * Records the host this node's published container ports are reachable
+     * at (agent-advertised or the connection's remote address). Phase-3
+     * node-port seam; phase 4 replaces it with tailnet URLs.
+     */
+    readonly recordEndpointHost: (input: {
+      readonly nodeId: string;
+      readonly host: string;
+    }) => Effect.Effect<void>;
+    readonly endpointHost: (nodeId: string) => Effect.Effect<Option.Option<string>>;
     readonly markConnected: (nodeId: string) => Effect.Effect<void>;
     readonly markDisconnected: (nodeId: string) => Effect.Effect<void>;
     readonly connectedNodeIds: SubscriptionRef.SubscriptionRef<ReadonlySet<string>>;
@@ -122,6 +133,24 @@ export class NodeRegistry extends Context.Service<
         `.pipe(Effect.orDie);
       });
 
+      const recordEndpointHost = Effect.fn("NodeRegistry.recordEndpointHost")(function* (input: {
+        readonly nodeId: string;
+        readonly host: string;
+      }) {
+        const now = yield* Clock.currentTimeMillis;
+        yield* sql`
+          UPDATE nodes SET endpoint_host = ${input.host}, updated_at = ${now}
+          WHERE id = ${input.nodeId}
+        `.pipe(Effect.orDie);
+      });
+
+      const endpointHost = Effect.fn("NodeRegistry.endpointHost")(function* (nodeId: string) {
+        const rows = yield* sql<{ endpoint_host: string | null }>`
+          SELECT endpoint_host FROM nodes WHERE id = ${nodeId}
+        `.pipe(Effect.orDie);
+        return Option.fromNullishOr(rows[0]?.endpoint_host);
+      });
+
       const markConnected = (nodeId: string) =>
         SubscriptionRef.update(
           connectedNodeIds,
@@ -169,6 +198,8 @@ export class NodeRegistry extends Context.Service<
         registerWithToken,
         authenticate,
         recordHeartbeat,
+        recordEndpointHost,
+        endpointHost,
         markConnected,
         markDisconnected,
         connectedNodeIds,

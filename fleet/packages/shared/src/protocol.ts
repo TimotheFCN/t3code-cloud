@@ -43,6 +43,13 @@ export const AgentHello = Schema.Struct({
   kind: Schema.Literal("hello"),
   protocolVersion: Schema.Int,
   nodeName: Schema.String,
+  /**
+   * Host clients and the controller can reach this node's published container
+   * ports at (phase-3 node-port endpoints). Optional: the controller falls
+   * back to the connection's remote address. Phase 4 replaces node-port
+   * endpoints with per-environment tailnet URLs.
+   */
+  endpointHost: Schema.optional(Schema.String),
   auth: Schema.Union([JoinTokenAuth, CredentialAuth]),
 });
 export type AgentHello = typeof AgentHello.Type;

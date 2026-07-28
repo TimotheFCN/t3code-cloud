@@ -59,19 +59,27 @@ Both processes read (later sources win): built-in defaults, a JSON config file, 
 variables.
 
 Controller — file path from `FLEET_CONTROLLER_CONFIG`; keys `host`, `port`, `dataDir`,
-`heartbeatIntervalMillis`, `joinTokenTtlSeconds`; env equivalents `FLEET_CONTROLLER_HOST`,
+`heartbeatIntervalMillis`, `joinTokenTtlSeconds`, `statusPollIntervalMillis`,
+`environmentHealthTimeoutMillis`; env equivalents `FLEET_CONTROLLER_HOST`,
 `FLEET_CONTROLLER_PORT`, `FLEET_CONTROLLER_DATA_DIR`, `FLEET_CONTROLLER_HEARTBEAT_INTERVAL_MS`,
-`FLEET_CONTROLLER_JOIN_TOKEN_TTL_SECONDS`.
+`FLEET_CONTROLLER_JOIN_TOKEN_TTL_SECONDS`, `FLEET_CONTROLLER_STATUS_POLL_INTERVAL_MS`,
+`FLEET_CONTROLLER_ENVIRONMENT_HEALTH_TIMEOUT_MS`.
 
 Agent — file path from `FLEET_AGENT_CONFIG`; keys `controllerUrl`, `nodeName`, `stateDir`,
-`joinToken`, `dockerRuntime`, `snapshotRetention`, `helperImage`; env equivalents
-`FLEET_AGENT_CONTROLLER_URL`, `FLEET_AGENT_NODE_NAME`, `FLEET_AGENT_STATE_DIR`,
-`FLEET_AGENT_JOIN_TOKEN`, `FLEET_AGENT_DOCKER_RUNTIME`, `FLEET_AGENT_SNAPSHOT_RETENTION`,
-`FLEET_AGENT_HELPER_IMAGE`.
+`joinToken`, `advertiseHost`, `dockerRuntime`, `snapshotRetention`, `helperImage`; env
+equivalents `FLEET_AGENT_CONTROLLER_URL`, `FLEET_AGENT_NODE_NAME`, `FLEET_AGENT_STATE_DIR`,
+`FLEET_AGENT_JOIN_TOKEN`, `FLEET_AGENT_ADVERTISE_HOST`, `FLEET_AGENT_DOCKER_RUNTIME`,
+`FLEET_AGENT_SNAPSHOT_RETENTION`, `FLEET_AGENT_HELPER_IMAGE`. `advertiseHost` is the host the
+controller uses to reach container ports published on the node (phase-3 node-port endpoints);
+when unset, the controller uses the agent connection's remote address. Phase 4 replaces
+node-port endpoints with per-environment tailnet URLs.
 
-The controller is the only stateful component (SQLite under `dataDir`, forward-only migrations
-applied at start). The agent's local state is `<stateDir>/credential.json` (mode 0600) plus
-volume snapshot tarballs under `<stateDir>/snapshots/<envId>/`.
+The controller is the only stateful component: SQLite under `dataDir` (forward-only migrations
+applied at start), the encrypted vault under `dataDir/vault/` (an `age` identity file, mode 0600,
+plus `secrets.json` holding encrypted payloads keyed by ref — nothing secret rests in plaintext),
+and destroy-time final-work archives under `dataDir/archives/`. The agent's local state is
+`<stateDir>/credential.json` (mode 0600) plus volume snapshot tarballs under
+`<stateDir>/snapshots/<envId>/`.
 
 ## The docker driver
 
@@ -87,15 +95,37 @@ running environments without any bookkeeping. One named volume per environment
 (`t3env-<id>-home`) mounts at `/root` — the durability contract is documented in
 `image/README.md`.
 
-## HTTP API (phases 1–2)
+## HTTP API (phases 1–3)
 
-| Endpoint                       | Description                                                       |
-| ------------------------------ | ----------------------------------------------------------------- |
-| `GET /healthz`                 | Liveness                                                          |
-| `GET /api/nodes`               | Node inventory with derived health and live capacity              |
-| `POST /api/join-tokens`        | Mint a single-use join token (`{ "ttlSeconds"?: n }`)             |
-| `GET /api/images`              | Registered base images                                            |
-| `POST /api/images`             | Register an image reference (`{ "reference": "t3env:0.1.0" }`)    |
-| `POST /api/images/:id/current` | Make an image the one new environments use                        |
-| `POST /api/images/:id/pull`    | Pull on one node (`{ "nodeId"?: "..." }`) or every connected node |
-| `GET /ws/agent`                | Agent WebSocket endpoint (protocol in `packages/shared`)          |
+| Endpoint                                  | Description                                                             |
+| ----------------------------------------- | ----------------------------------------------------------------------- |
+| `GET /healthz`                            | Liveness                                                                |
+| `GET /api/nodes`                          | Node inventory with derived health and live capacity                    |
+| `POST /api/join-tokens`                   | Mint a single-use join token (`{ "ttlSeconds"?: n }`)                   |
+| `GET /api/images`                         | Registered base images                                                  |
+| `POST /api/images`                        | Register an image reference (`{ "reference": "t3env:0.1.0" }`)          |
+| `POST /api/images/:id/current`            | Make an image the one new environments use                              |
+| `POST /api/images/:id/pull`               | Pull on one node (`{ "nodeId"?: "..." }`) or every connected node       |
+| `GET /api/environments`                   | Environment inventory (desired/observed state, endpoint, activity)      |
+| `POST /api/environments`                  | Create (`{ "gitUrl", "gitBranch"?, "nodeId"?, "name"? }`) — async; poll |
+| `GET /api/environments/:id`               | One environment, including its create step and last observed status     |
+| `POST /api/environments/:id/pairing-link` | Mint a one-time `/pair#token=...` URL (returned once, never stored)     |
+| `POST /api/environments/:id/destroy`      | Destroy (`{ "archive"?: bool }` archives uncommitted work first)        |
+| `GET /ws/agent`                           | Agent WebSocket endpoint (protocol in `packages/shared`)                |
+
+## Environment lifecycle (phase 3)
+
+`POST /api/environments` schedules the environment onto a node (explicit `nodeId` or the
+connected node with the most free memory) and returns immediately; a persisted step machine
+(`scheduled → image-ready → created → started → healthy → session-issued → ready`) drives the
+create in the background and survives controller restarts (startup reconciliation resumes
+whatever was mid-flight). The container entrypoint clones the repo, runs the repo's
+`.t3env/setup.sh` hook when present, registers the workspace with `t3 project add`, and starts
+`t3 serve` (see `image/README.md`).
+
+After the T3 server answers its descriptor endpoint, the controller execs
+`t3 auth session issue --json --label fleet-controller` once, stores the admin session in the
+encrypted vault, and from then on talks to the environment over HTTP only: status polling
+(`/.well-known/t3/environment` + `/api/orchestration/snapshot`) and pairing-link minting
+(`POST /api/auth/pairing-token`). Destroy optionally archives the uncommitted diff, revokes the
+controller's session, removes the container and volume, and deletes the vault secret.

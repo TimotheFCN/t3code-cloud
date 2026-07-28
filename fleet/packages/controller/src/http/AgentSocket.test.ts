@@ -1,4 +1,5 @@
 import { createServer } from "node:http";
+import * as NodeFsSync from "node:fs";
 import * as NodeFs from "node:fs/promises";
 import * as NodeOs from "node:os";
 import * as NodePath from "node:path";
@@ -45,9 +46,12 @@ import { NodeRegistry } from "../nodes/NodeRegistry.ts";
 const testConfig: ControllerConfigShape = {
   host: "127.0.0.1",
   port: 0,
-  dataDir: "unused-in-tests",
+  // The vault layer creates `<dataDir>/vault` at build time.
+  dataDir: NodeFsSync.mkdtempSync(NodePath.join(NodeOs.tmpdir(), "fleet-controller-test-")),
   heartbeatIntervalMillis: 100,
   joinTokenTtlSeconds: 900,
+  statusPollIntervalMillis: 60_000,
+  environmentHealthTimeoutMillis: 10_000,
 };
 
 /** Full in-process controller on an ephemeral port with an in-memory DB. */
@@ -102,6 +106,7 @@ const runAgent = (options: { readonly stateDir: string; readonly joinToken?: str
             options.joinToken === undefined
               ? Option.none()
               : Option.some(Redacted.make(options.joinToken)),
+          advertiseHost: Option.none(),
           dockerRuntime: agentDefaults.dockerRuntime,
           snapshotRetention: agentDefaults.snapshotRetention,
           helperImage: agentDefaults.helperImage,

@@ -50,6 +50,7 @@ const makeConfig = (overrides?: Partial<AgentConfigShape>): AgentConfigShape => 
   nodeName: "driver-test-node",
   stateDir,
   joinToken: Option.none(),
+  advertiseHost: Option.none(),
   dockerRuntime: "runc",
   snapshotRetention: 2,
   helperImage: HELPER_IMAGE,
