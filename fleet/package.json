@@ -1,0 +1,23 @@
+{
+  "name": "t3fleet",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "controller": "node packages/controller/src/main.ts",
+    "agent": "node packages/agent/src/main.ts",
+    "typecheck": "tsc --noEmit",
+    "lint": "oxlint packages",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "devDependencies": {
+    "@types/node": "24.12.4",
+    "oxlint": "1.76.0",
+    "typescript": "~6.0.3",
+    "vitest": "4.1.10"
+  },
+  "engines": {
+    "node": ">=24.13"
+  },
+  "packageManager": "pnpm@11.10.0"
+}

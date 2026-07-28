@@ -1,0 +1,7 @@
+packages:
+  - packages/*
+
+# msgpackr-extract is an optional native accelerator pulled in transitively by
+# effect's msgpack support; the pure-JS fallback is fine for the control plane.
+allowBuilds:
+  msgpackr-extract: false

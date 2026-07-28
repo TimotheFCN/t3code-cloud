@@ -1,0 +1,16 @@
+{
+  "name": "@t3fleet/controller",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@effect/platform-node": "4.0.0-beta.102",
+    "@effect/sql-sqlite-node": "4.0.0-beta.102",
+    "@t3fleet/shared": "workspace:*",
+    "effect": "4.0.0-beta.102"
+  },
+  "devDependencies": {
+    "@effect/vitest": "4.0.0-beta.102",
+    "@t3fleet/agent": "workspace:*"
+  }
+}
