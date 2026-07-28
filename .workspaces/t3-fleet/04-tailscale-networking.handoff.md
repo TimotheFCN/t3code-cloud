@@ -156,21 +156,42 @@ inspect field — use `{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}`
   (`backend error: invalid key: unable to validate API key`), and the boot aborted loudly with
   exit 1 — the failure path behaves as designed against real binaries.
 
-### Pending on a real tailnet (this VM has no Tailscale account/credentials)
+### Manual validation on a real tailnet (performed, end to end)
 
-Required by the phase's validation section and **not yet performed** — run on real hardware with
-a real OAuth client before considering phase 4 fully validated:
+Run against the operator's personal tailnet `bearded-godzilla.ts.net` (default Personal-plan
+feature set — MagicDNS + HTTPS certificates enabled were sufficient; ~6 devices), with a real
+OAuth client (scopes `auth_keys` write + `devices:core` write, tag `tag:t3-env`), a real
+controller + agent on this host driving `t3env:dev` under `runc`:
 
-1. Create an environment and open `https://env-<id>.<tailnet>.ts.net/pair#token=...` from
-   another tailnet device; verify the certificate is valid and chat works over WSS.
-2. Restart the container; verify the same URL (device identity reuse with the _real_ tailscaled
-   state machine, including `tailscale up --hostname=… --accept-dns=false` re-run semantics).
-3. Destroy; verify the device disappears from the admin console.
-4. Kernel-TUN mode under sysbox (this VM has no sysbox; only userspace mode ran for real).
-5. Real certificate-issuance latency through the `healthy` step (the `status_detail` path).
-6. Note in this file which Tailscale plan was used once verified.
+1. **Create → ready**: OAuth token exchange, tagged key mint, container joined as
+   `env-86c3a6f3` (userspace tailscaled, state on the volume), device discovered, environment
+   `ready` at `https://env-86c3a6f3.bearded-godzilla.ts.net` in ~1 minute. The
+   `status_detail` cert-wait message was observable during the `tailnet-joined → healthy`
+   window, and the certificate chain validated as publicly trusted (`curl ssl_verify_result 0`).
+2. **Pairing from another tailnet device**: the operator opened the minted
+   `/pair#token=…` URL from a macOS device — valid HTTPS padlock, pairing succeeded, and the
+   chat UI worked over WSS (confirmed by the operator).
+3. **Restart keeps the URL**: `docker restart` → second boot logged
+   "existing tailscale identity found — rejoining" (no auth key), the same URL answered again
+   within seconds, and the tailnet still had exactly one `env-86c3a6f3` device with the same
+   node id (`tailscale up --hostname --accept-dns=false` re-run semantics verified against the
+   real CLI).
+4. **Destroy removes the device**: container + volume gone, environment `destroyed`, and the
+   device disappeared from the tailnet (device list back to its pre-test count).
 
-Sysbox items from phases 2–3 remain pending as before.
+Host note: this box is an unprivileged Proxmox LXC whose own tailscaled runs userspace-mode, so
+the controller could not reach `*.ts.net` transparently. Workaround used (and reverted after):
+`--outbound-http-proxy-listen=localhost:1055` on the host tailscaled +
+`NODE_USE_ENV_PROXY=1 HTTPS_PROXY=http://127.0.0.1:1055` on the controller process — Node 24's
+built-in fetch honors the env proxy, no fleet code changes. A controller host with kernel-TUN
+tailscaled needs none of this; consider documenting the proxy recipe in phase 8 if LXC-hosted
+controllers should be supported.
+
+### Still pending on real hardware
+
+1. Kernel-TUN mode under **sysbox** (no sysbox on this VM; the real-tailnet run used userspace
+   networking under `runc` — inbound serving is identical by design, but the sysbox TUN path
+   itself is unexercised). Sysbox items from phases 2–3 remain pending as before.
 
 ## Notes to later phases
 
