@@ -8,7 +8,6 @@ import {
   type RejectionReason,
 } from "@t3fleet/shared/protocol";
 import * as Effect from "effect/Effect";
-import * as Option from "effect/Option";
 import * as Redacted from "effect/Redacted";
 import * as Schema from "effect/Schema";
 import * as HttpRouter from "effect/unstable/http/HttpRouter";
@@ -28,10 +27,6 @@ class HandshakeRejected extends Schema.TaggedErrorClass<HandshakeRejected>()("Ha
 class ProtocolViolation extends Schema.TaggedErrorClass<ProtocolViolation>()("ProtocolViolation", {
   message: Schema.String,
 }) {}
-
-/** Node reports IPv4 peers of a dual-stack listener as `::ffff:a.b.c.d`. */
-const stripPort = (address: string): string =>
-  address.startsWith("::ffff:") ? address.slice("::ffff:".length) : address;
 
 /**
  * The controller side of the agent protocol: accepts the WebSocket upgrade,
@@ -104,14 +99,6 @@ export const layer = HttpRouter.use((router) =>
             });
           }
           const nodeId = joinedNodeId;
-          // Phase-3 node-port endpoints: record where this node's published
-          // container ports are reachable. Agent-advertised host wins; the
-          // connection's remote address is the fallback.
-          const remoteHost = Option.map(request.remoteAddress, stripPort);
-          const host = hello.endpointHost ?? Option.getOrNull(remoteHost);
-          if (host !== null) {
-            yield* registry.recordEndpointHost({ nodeId, host });
-          }
           yield* connections.register(nodeId, write);
           yield* registry.markConnected(nodeId);
         });

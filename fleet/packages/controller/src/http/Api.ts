@@ -25,6 +25,9 @@ import { ImageAlreadyExistsError, ImageNotFoundError, Images } from "../images/I
 import { ImagePulls } from "../images/ImagePulls.ts";
 import { JoinTokens } from "../nodes/JoinTokens.ts";
 import { NodeRegistry } from "../nodes/NodeRegistry.ts";
+import { TailnetNotConfiguredError } from "../tailnet/Tailnet.ts";
+import { TailnetSettings } from "../tailnet/TailnetSettings.ts";
+import { VaultError } from "../vault/Vault.ts";
 
 const SystemGroup = HttpApiGroup.make("system").add(
   HttpApiEndpoint.get("health", "/healthz", {
@@ -86,6 +89,33 @@ const EnvironmentNotReady = EnvironmentNotReadyError.pipe(HttpApiSchema.status(4
 const PairingMintFailed = PairingMintError.pipe(HttpApiSchema.status(502));
 const NoSchedulableNode = NoSchedulableNodeError.pipe(HttpApiSchema.status(409));
 const NoCurrentImage = NoCurrentImageError.pipe(HttpApiSchema.status(409));
+const TailnetNotConfigured = TailnetNotConfiguredError.pipe(HttpApiSchema.status(409));
+const VaultFailure = VaultError.pipe(HttpApiSchema.status(500));
+
+/** Non-secret view of the Tailscale OAuth configuration. */
+const TailscaleSettingsView = Schema.Struct({
+  configured: Schema.Boolean,
+  clientId: Schema.NullOr(Schema.String),
+  tag: Schema.String,
+});
+
+const SettingsGroup = HttpApiGroup.make("settings").add(
+  HttpApiEndpoint.get("tailscale", "/api/settings/tailscale", {
+    success: TailscaleSettingsView,
+  }),
+  // Stores/replaces the Tailscale OAuth client. The secret goes through the
+  // vault seam; it is accepted here once and never returned by any endpoint.
+  HttpApiEndpoint.put("tailscaleUpdate", "/api/settings/tailscale", {
+    payload: Schema.Struct({
+      clientId: Schema.String.check(Schema.isMinLength(1)),
+      clientSecret: Schema.String.check(Schema.isMinLength(1)),
+      /** ACL tag minted keys carry; defaults to `tag:t3-env`. */
+      tag: Schema.optional(Schema.String),
+    }),
+    success: TailscaleSettingsView,
+    error: VaultFailure,
+  }),
+);
 
 const EnvironmentsGroup = HttpApiGroup.make("environments").add(
   HttpApiEndpoint.get("list", "/api/environments", {
@@ -101,7 +131,7 @@ const EnvironmentsGroup = HttpApiGroup.make("environments").add(
       name: Schema.optional(Schema.String),
     }),
     success: EnvironmentSummary,
-    error: [NoSchedulableNode, NoCurrentImage],
+    error: [NoSchedulableNode, NoCurrentImage, TailnetNotConfigured],
   }),
   HttpApiEndpoint.get("get", "/api/environments/:id", {
     params: { id: Schema.String },
@@ -129,7 +159,8 @@ export class FleetApi extends HttpApi.make("fleet")
   .add(NodesGroup)
   .add(JoinTokensGroup)
   .add(ImagesGroup)
-  .add(EnvironmentsGroup) {}
+  .add(EnvironmentsGroup)
+  .add(SettingsGroup) {}
 
 const SystemHandlers = HttpApiBuilder.group(
   FleetApi,
@@ -182,6 +213,23 @@ const ImagesHandlers = HttpApiBuilder.group(
   }),
 );
 
+const SettingsHandlers = HttpApiBuilder.group(
+  FleetApi,
+  "settings",
+  Effect.fn(function* (handlers) {
+    const settings = yield* TailnetSettings;
+    return handlers
+      .handle("tailscale", () => settings.status)
+      .handle("tailscaleUpdate", ({ payload }) =>
+        settings.configure({
+          clientId: payload.clientId,
+          clientSecret: Redacted.make(payload.clientSecret),
+          tag: payload.tag,
+        }),
+      );
+  }),
+);
+
 const EnvironmentsHandlers = HttpApiBuilder.group(
   FleetApi,
   "environments",
@@ -206,7 +254,7 @@ const EnvironmentsHandlers = HttpApiBuilder.group(
   }),
 );
 
-/** All HTTP API routes (health, nodes, join tokens, images, environments). */
+/** All HTTP API routes (health, nodes, join tokens, images, environments, settings). */
 export const layer = HttpApiBuilder.layer(FleetApi).pipe(
   Layer.provide([
     SystemHandlers,
@@ -214,5 +262,6 @@ export const layer = HttpApiBuilder.layer(FleetApi).pipe(
     JoinTokensHandlers,
     ImagesHandlers,
     EnvironmentsHandlers,
+    SettingsHandlers,
   ]),
 );

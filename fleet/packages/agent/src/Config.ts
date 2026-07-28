@@ -30,13 +30,6 @@ export interface AgentConfigShape {
   readonly stateDir: string;
   readonly joinToken: Option.Option<Redacted.Redacted<string>>;
   /**
-   * Host name/IP the controller should use to reach container ports published
-   * on this node (phase-3 node-port endpoints). When unset, the controller
-   * falls back to this connection's remote address. Removed with the
-   * node-port path in phase 4.
-   */
-  readonly advertiseHost: Option.Option<string>;
-  /**
    * Container runtime for environment containers. Defaults to `sysbox-runc`
    * — the only supported production runtime (inner Docker without
    * `--privileged`). The docker driver fails loudly when it is missing; a
@@ -54,7 +47,6 @@ const ConfigFile = Schema.Struct({
   nodeName: Schema.optional(Schema.String),
   stateDir: Schema.optional(Schema.String),
   joinToken: Schema.optional(Schema.String),
-  advertiseHost: Schema.optional(Schema.String),
   dockerRuntime: Schema.optional(Schema.String),
   snapshotRetention: Schema.optional(Schema.Int),
   helperImage: Schema.optional(Schema.String),
@@ -105,7 +97,6 @@ export class AgentConfig extends Context.Service<AgentConfig, AgentConfigShape>(
         nodeName: yield* Config.string("FLEET_AGENT_NODE_NAME").pipe(Config.option),
         stateDir: yield* Config.string("FLEET_AGENT_STATE_DIR").pipe(Config.option),
         joinToken: yield* Config.redacted("FLEET_AGENT_JOIN_TOKEN").pipe(Config.option),
-        advertiseHost: yield* Config.string("FLEET_AGENT_ADVERTISE_HOST").pipe(Config.option),
         dockerRuntime: yield* Config.string("FLEET_AGENT_DOCKER_RUNTIME").pipe(Config.option),
         snapshotRetention: yield* Config.int("FLEET_AGENT_SNAPSHOT_RETENTION").pipe(Config.option),
         helperImage: yield* Config.string("FLEET_AGENT_HELPER_IMAGE").pipe(Config.option),
@@ -125,9 +116,6 @@ export class AgentConfig extends Context.Service<AgentConfig, AgentConfigShape>(
           fromFile.joinToken === undefined
             ? Option.none()
             : Option.some(Redacted.make(fromFile.joinToken)),
-        ),
-        advertiseHost: Option.orElse(env.advertiseHost, () =>
-          Option.fromUndefinedOr(fromFile.advertiseHost),
         ),
         dockerRuntime: Option.getOrElse(
           env.dockerRuntime,

@@ -34,8 +34,11 @@ export interface EnvironmentRow {
   readonly desiredState: EnvironmentDesiredState;
   readonly createStep: EnvironmentCreateStep;
   readonly observedState: EnvironmentObservedState;
-  readonly hostPort: number | null;
   readonly endpointUrl: string | null;
+  readonly tailnetDeviceId: string | null;
+  readonly tsAuthKeyRef: string | null;
+  readonly tsAuthKeyId: string | null;
+  readonly statusDetail: string | null;
   readonly t3SessionRef: string | null;
   readonly t3SessionId: string | null;
   readonly t3EnvironmentId: string | null;
@@ -57,8 +60,11 @@ interface RawRow {
   readonly desired_state: string;
   readonly create_step: string;
   readonly observed_state: string;
-  readonly host_port: number | null;
   readonly endpoint_url: string | null;
+  readonly tailnet_device_id: string | null;
+  readonly ts_authkey_ref: string | null;
+  readonly ts_authkey_id: string | null;
+  readonly status_detail: string | null;
   readonly t3_session_ref: string | null;
   readonly t3_session_id: string | null;
   readonly t3_environment_id: string | null;
@@ -81,7 +87,9 @@ export const toSummary = (row: EnvironmentRow): EnvironmentSummary => ({
   createStep: row.createStep,
   observedState: row.observedState,
   endpointUrl: row.endpointUrl,
+  tailnetDeviceId: row.tailnetDeviceId,
   t3EnvironmentId: row.t3EnvironmentId,
+  statusDetail: row.statusDetail,
   activity: row.activity,
   lastStatusAtMillis: row.lastStatusAtMillis,
   error: row.error,
@@ -109,11 +117,20 @@ export class EnvironmentsRepo extends Context.Service<
     readonly find: (id: string) => Effect.Effect<Option.Option<EnvironmentRow>>;
     readonly list: Effect.Effect<ReadonlyArray<EnvironmentRow>>;
     readonly setCreateStep: (id: string, step: EnvironmentCreateStep) => Effect.Effect<void>;
-    readonly setEndpoint: (input: {
+    /** Records the minted tailnet auth key (vault ref + Tailscale key id). */
+    readonly setTailnetKey: (input: {
       readonly id: string;
-      readonly hostPort: number;
+      readonly keyRef: string;
+      readonly keyId: string;
+    }) => Effect.Effect<void>;
+    /** Clears the auth-key bookkeeping once the device has joined. */
+    readonly clearTailnetKey: (id: string) => Effect.Effect<void>;
+    readonly setTailnetDevice: (input: {
+      readonly id: string;
+      readonly deviceId: string;
       readonly endpointUrl: string;
     }) => Effect.Effect<void>;
+    readonly setStatusDetail: (id: string, detail: string | null) => Effect.Effect<void>;
     readonly setT3Identity: (input: {
       readonly id: string;
       readonly t3EnvironmentId: string;
@@ -154,8 +171,11 @@ export class EnvironmentsRepo extends Context.Service<
           desiredState: raw.desired_state as EnvironmentDesiredState,
           createStep: raw.create_step as EnvironmentCreateStep,
           observedState: raw.observed_state as EnvironmentObservedState,
-          hostPort: raw.host_port,
           endpointUrl: raw.endpoint_url,
+          tailnetDeviceId: raw.tailnet_device_id,
+          tsAuthKeyRef: raw.ts_authkey_ref,
+          tsAuthKeyId: raw.ts_authkey_id,
+          statusDetail: raw.status_detail,
           t3SessionRef: raw.t3_session_ref,
           t3SessionId: raw.t3_session_id,
           t3EnvironmentId: raw.t3_environment_id,
@@ -234,16 +254,46 @@ export class EnvironmentsRepo extends Context.Service<
         yield* touch(id);
       });
 
-      const setEndpoint = Effect.fn("EnvironmentsRepo.setEndpoint")(function* (input: {
+      const setTailnetKey = Effect.fn("EnvironmentsRepo.setTailnetKey")(function* (input: {
         readonly id: string;
-        readonly hostPort: number;
-        readonly endpointUrl: string;
+        readonly keyRef: string;
+        readonly keyId: string;
       }) {
         yield* sql`
-          UPDATE environments SET host_port = ${input.hostPort}, endpoint_url = ${input.endpointUrl}
+          UPDATE environments SET ts_authkey_ref = ${input.keyRef}, ts_authkey_id = ${input.keyId}
           WHERE id = ${input.id}
         `.pipe(Effect.orDie);
         yield* touch(input.id);
+      });
+
+      const clearTailnetKey = Effect.fn("EnvironmentsRepo.clearTailnetKey")(function* (id: string) {
+        yield* sql`
+          UPDATE environments SET ts_authkey_ref = NULL, ts_authkey_id = NULL WHERE id = ${id}
+        `.pipe(Effect.orDie);
+        yield* touch(id);
+      });
+
+      const setTailnetDevice = Effect.fn("EnvironmentsRepo.setTailnetDevice")(function* (input: {
+        readonly id: string;
+        readonly deviceId: string;
+        readonly endpointUrl: string;
+      }) {
+        yield* sql`
+          UPDATE environments
+          SET tailnet_device_id = ${input.deviceId}, endpoint_url = ${input.endpointUrl}
+          WHERE id = ${input.id}
+        `.pipe(Effect.orDie);
+        yield* touch(input.id);
+      });
+
+      const setStatusDetail = Effect.fn("EnvironmentsRepo.setStatusDetail")(function* (
+        id: string,
+        detail: string | null,
+      ) {
+        yield* sql`UPDATE environments SET status_detail = ${detail} WHERE id = ${id}`.pipe(
+          Effect.orDie,
+        );
+        yield* touch(id);
       });
 
       const setT3Identity = Effect.fn("EnvironmentsRepo.setT3Identity")(function* (input: {
@@ -292,7 +342,8 @@ export class EnvironmentsRepo extends Context.Service<
         message: string,
       ) {
         yield* sql`
-          UPDATE environments SET observed_state = 'error', error = ${message} WHERE id = ${id}
+          UPDATE environments SET observed_state = 'error', error = ${message}, status_detail = NULL
+          WHERE id = ${id}
         `.pipe(Effect.orDie);
         yield* touch(id);
       });
@@ -311,7 +362,9 @@ export class EnvironmentsRepo extends Context.Service<
 
       const markDestroyed = Effect.fn("EnvironmentsRepo.markDestroyed")(function* (id: string) {
         yield* sql`
-          UPDATE environments SET observed_state = 'destroyed', endpoint_url = NULL, host_port = NULL
+          UPDATE environments
+          SET observed_state = 'destroyed', endpoint_url = NULL, tailnet_device_id = NULL,
+              ts_authkey_ref = NULL, ts_authkey_id = NULL, status_detail = NULL
           WHERE id = ${id}
         `.pipe(Effect.orDie);
         yield* touch(id);
@@ -349,7 +402,10 @@ export class EnvironmentsRepo extends Context.Service<
         find,
         list,
         setCreateStep,
-        setEndpoint,
+        setTailnetKey,
+        clearTailnetKey,
+        setTailnetDevice,
+        setStatusDetail,
         setT3Identity,
         setSession,
         clearSession,

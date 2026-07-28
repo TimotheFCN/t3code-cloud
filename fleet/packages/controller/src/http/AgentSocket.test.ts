@@ -52,6 +52,10 @@ const testConfig: ControllerConfigShape = {
   joinTokenTtlSeconds: 900,
   statusPollIntervalMillis: 60_000,
   environmentHealthTimeoutMillis: 10_000,
+  tailscaleApiUrl: "http://127.0.0.1:1", // never reached in these tests
+  tsAuthKeyTtlSeconds: 3600,
+  tailnetJoinTimeoutMillis: 10_000,
+  tailnetEndpointScheme: "http",
 };
 
 /** Full in-process controller on an ephemeral port with an in-memory DB. */
@@ -106,7 +110,6 @@ const runAgent = (options: { readonly stateDir: string; readonly joinToken?: str
             options.joinToken === undefined
               ? Option.none()
               : Option.some(Redacted.make(options.joinToken)),
-          advertiseHost: Option.none(),
           dockerRuntime: agentDefaults.dockerRuntime,
           snapshotRetention: agentDefaults.snapshotRetention,
           helperImage: agentDefaults.helperImage,

@@ -1,31 +1,115 @@
 #!/usr/bin/env bash
-# t3env entrypoint — the phase-3 bootstrap sequence:
+# t3env entrypoint — the bootstrap sequence:
 #
-#   1. start the inner Docker daemon (data root on the environment volume,
+#   1. start tailscaled (state on the environment volume — stable device
+#      identity) and join the tailnet as $T3ENV_TS_HOSTNAME; first boot uses
+#      the controller-minted $TS_AUTHKEY, every later boot reuses the
+#      persisted identity and never needs a key again
+#   2. start the inner Docker daemon (data root on the environment volume,
 #      see /etc/docker/daemon.json)
-#   2. clone the project into /root/workspace (skipped when the volume
+#   3. clone the project into /root/workspace (skipped when the volume
 #      already has it — recreates keep the workspace)
-#   3. run the project's setup hook (.t3env/setup.sh) when present
-#   4. register the workspace with `t3 project add` (idempotent)
-#   5. start `t3 serve`, configured entirely through T3CODE_* env vars
+#   4. run the project's setup hook (.t3env/setup.sh) when present
+#   5. register the workspace with `t3 project add` (idempotent)
+#   6. start `t3 serve`, configured entirely through T3CODE_* env vars
+#      (with T3CODE_TAILSCALE_SERVE=1 it publishes itself over HTTPS via
+#      Tailscale Serve)
 #
-# Phase 4 prepends tailscaled + tailnet join; phase 5 adds credential
-# materialization before the clone.
+# Phase 5 adds credential materialization before the clone.
 #
 # The inner daemon needs the sysbox runtime on the node. Without it (e.g.
 # plain runc during development) dockerd fails to start; that is degraded but
-# deliberate — the T3 server still runs, and the warning below says why.
+# deliberate — the T3 server still runs, and the warning below says why. A
+# failed tailnet join, by contrast, aborts loudly: without its tailnet
+# endpoint the environment is unreachable by design (no ports are published).
 set -uo pipefail
 
 log() { echo "[t3env] $*" >&2; }
 
 WORKSPACE_DIR="/root/workspace"
 SETUP_HOOK=".t3env/setup.sh"
+TS_STATE_DIR="${T3ENV_TS_STATE_DIR:-/root/.tailscale}"
+# The socket must stay at the default in production — `t3 serve
+# --tailscale-serve` runs the `tailscale` CLI without a --socket flag. The
+# overrides exist so entrypoint tests can run unprivileged outside a
+# container.
+TS_SOCKET="${T3ENV_TS_SOCKET:-/var/run/tailscale/tailscaled.sock}"
+TUN_DEVICE="${T3ENV_TUN_DEVICE:-/dev/net/tun}"
+LOG_DIR="${T3ENV_LOG_DIR:-/var/log}"
+
+ts_cli() { tailscale "--socket=${TS_SOCKET}" "$@"; }
+
+ts_backend_state() {
+  # Extracts BackendState from `tailscale status --json` without a jq
+  # dependency (NeedsLogin / Running / Stopped / ...).
+  ts_cli status --json 2>/dev/null |
+    sed -n 's/.*"BackendState"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' |
+    head -n 1
+}
+
+TAILSCALED_PID=""
+if [ -n "${T3ENV_TS_HOSTNAME:-}" ] && [ "${T3ENV_SKIP_TAILSCALE:-0}" != "1" ]; then
+  tailscaled_args=("--statedir=${TS_STATE_DIR}" "--socket=${TS_SOCKET}")
+  # sysbox exposes /dev/net/tun, so production environments run tailscaled in
+  # kernel mode; without a TUN device (plain runc in development) userspace
+  # networking serves inbound traffic just the same.
+  if [ ! -e "${TUN_DEVICE}" ]; then
+    log "no ${TUN_DEVICE} — starting tailscaled in userspace-networking mode"
+    tailscaled_args+=("--tun=userspace-networking")
+  fi
+  mkdir -p "${TS_STATE_DIR}"
+  log "starting tailscaled (state in ${TS_STATE_DIR})"
+  tailscaled "${tailscaled_args[@]}" >>"${LOG_DIR}/tailscaled.log" 2>&1 &
+  TAILSCALED_PID=$!
+  tailscaled_ready=0
+  for _ in $(seq 1 30); do
+    if [ -S "${TS_SOCKET}" ]; then
+      tailscaled_ready=1
+      break
+    fi
+    if ! kill -0 "${TAILSCALED_PID}" 2>/dev/null; then
+      break
+    fi
+    sleep 1
+  done
+  if [ "${tailscaled_ready}" != "1" ]; then
+    log "ERROR: tailscaled did not come up — see /var/log/tailscaled.log"
+    exit 1
+  fi
+
+  # The same non-default flags are passed on every boot (`tailscale up`
+  # requires that); only the first join carries the single-use auth key.
+  # --accept-dns=false keeps the container's normal DNS resolution — the
+  # environment only serves inbound, it never needs to resolve tailnet peers.
+  up_args=("--hostname=${T3ENV_TS_HOSTNAME}" "--accept-dns=false" "--timeout=120s")
+  if [ "$(ts_backend_state)" = "NeedsLogin" ]; then
+    # First join. Never reached again once the volume has a logged-in
+    # identity — rejoins must reuse it (the device's URL is its identity).
+    if [ -z "${TS_AUTHKEY:-}" ]; then
+      log "ERROR: first tailnet join requires TS_AUTHKEY"
+      exit 1
+    fi
+    log "joining tailnet as ${T3ENV_TS_HOSTNAME}"
+    if ! ts_cli up "--authkey=${TS_AUTHKEY}" "${up_args[@]}"; then
+      log "ERROR: tailnet join failed — check the auth key and tailnet ACLs"
+      exit 1
+    fi
+  else
+    log "existing tailscale identity found — rejoining as ${T3ENV_TS_HOSTNAME}"
+    if ! ts_cli up "${up_args[@]}"; then
+      log "ERROR: tailnet rejoin failed — see ${LOG_DIR}/tailscaled.log"
+      exit 1
+    fi
+  fi
+  log "tailnet is up"
+fi
+# The single-use key must not leak into the server or provider CLIs.
+unset TS_AUTHKEY
 
 DOCKERD_PID=""
 if [ "${T3ENV_SKIP_DOCKERD:-0}" != "1" ]; then
   log "starting inner dockerd"
-  dockerd >>/var/log/dockerd.log 2>&1 &
+  dockerd >>"${LOG_DIR}/dockerd.log" 2>&1 &
   DOCKERD_PID=$!
   dockerd_ready=0
   for _ in $(seq 1 30); do
@@ -104,6 +188,9 @@ shutdown() {
   if [ -n "${DOCKERD_PID}" ]; then
     kill -TERM "${DOCKERD_PID}" 2>/dev/null || true
   fi
+  if [ -n "${TAILSCALED_PID}" ]; then
+    kill -TERM "${TAILSCALED_PID}" 2>/dev/null || true
+  fi
 }
 trap shutdown TERM INT
 
@@ -111,6 +198,9 @@ wait "${T3_PID}"
 exit_code=$?
 if [ -n "${DOCKERD_PID}" ]; then
   kill -TERM "${DOCKERD_PID}" 2>/dev/null || true
+fi
+if [ -n "${TAILSCALED_PID}" ]; then
+  kill -TERM "${TAILSCALED_PID}" 2>/dev/null || true
 fi
 # Reap whatever is left before giving up PID 1.
 wait 2>/dev/null || true

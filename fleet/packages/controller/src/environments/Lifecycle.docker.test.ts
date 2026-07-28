@@ -32,6 +32,7 @@ import { Images } from "../images/Images.ts";
 import { AgentConnections } from "../nodes/AgentConnections.ts";
 import { JoinTokens } from "../nodes/JoinTokens.ts";
 import { NodeRegistry } from "../nodes/NodeRegistry.ts";
+import { TailnetSettings } from "../tailnet/TailnetSettings.ts";
 import { Vault } from "../vault/Vault.ts";
 import { Environments } from "./Environments.ts";
 import { EnvironmentsRepo } from "./EnvironmentsRepo.ts";
@@ -39,14 +40,19 @@ import { PairingLinks } from "./PairingLinks.ts";
 import { StatusPoller } from "./StatusPoller.ts";
 
 /**
- * The phase-3 integration test: a real controller, a real agent with the
+ * The docker integration test: a real controller, a real agent with the
  * real docker driver, and a real `t3` binary (from npm) inside a container
  * built from the real entrypoint — driving create → status → pairing link →
  * destroy, with two environments for the same repo proving independence.
  *
  * Skipped without a local Docker daemon, like `DockerDriver.test.ts`. Uses
  * runtime `runc` (no sysbox on dev machines/CI); the inner dockerd is
- * skipped via `T3ENV_SKIP_DOCKERD=1` baked into the test image.
+ * skipped via `T3ENV_SKIP_DOCKERD=1` baked into the test image, and the
+ * tailnet join via `T3ENV_SKIP_TAILSCALE=1` — a fake Tailscale API stands in
+ * for the control plane, reporting each container's bridge IP as its device
+ * name so the controller's tailnet endpoints reach the real T3 servers
+ * (`tailnetEndpointScheme: "http"`; requires Linux, where the host reaches
+ * container bridge IPs directly).
  */
 const dockerAvailable = (() => {
   try {
@@ -77,7 +83,8 @@ ENV T3CODE_HOST=0.0.0.0 \\
     T3CODE_PORT=3773 \\
     T3CODE_HOME=/root/.t3 \\
     T3CODE_NO_BROWSER=1 \\
-    T3ENV_SKIP_DOCKERD=1
+    T3ENV_SKIP_DOCKERD=1 \\
+    T3ENV_SKIP_TAILSCALE=1
 WORKDIR /root
 ENTRYPOINT ["/usr/local/bin/t3env-entrypoint"]
 `;
@@ -91,6 +98,7 @@ const git = (cwd: string, args: ReadonlyArray<string>) =>
 let workDir = "";
 let gitServer: Server | null = null;
 let gitUrl = "";
+let fakeTailscale: Awaited<ReturnType<typeof startFakeTailscale>> | null = null;
 
 /** Serves a bare repo over git's dumb HTTP protocol (static files). */
 const serveBareRepo = (bareDir: string, host: string): Promise<{ url: string; server: Server }> =>
@@ -123,7 +131,104 @@ const serveBareRepo = (bareDir: string, host: string): Promise<{ url: string; se
     });
   });
 
-const makeConfig = (dataDir: string): ControllerConfigShape => ({
+const OAUTH_CLIENT_ID = "kDOCKERTEST";
+const OAUTH_CLIENT_SECRET = "tskey-client-kDOCKERTEST-fakesecret";
+
+/**
+ * A fake Tailscale control API standing in for the real coordination plane:
+ * minted keys register the hostname, and the device list resolves each
+ * hostname to the live container's bridge IP (`<ip>:3773`) — so the
+ * controller's "tailnet" endpoints are real, reachable T3 servers. A
+ * container that is not running yet simply has no device, which exercises
+ * the controller's join polling.
+ */
+const startFakeTailscale = (): Promise<{
+  url: string;
+  server: Server;
+  hostnames: Set<string>;
+  deletedDeviceIds: Array<string>;
+}> =>
+  new Promise((resolve, reject) => {
+    const hostnames = new Set<string>();
+    const deletedDeviceIds: Array<string> = [];
+    const accessToken = "tskey-api-dockertest";
+
+    const containerAddress = (hostname: string): string | null => {
+      try {
+        const ip = docker([
+          "inspect",
+          `t3env-${hostname}`,
+          "--format",
+          "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}",
+        ]).trim();
+        return ip.length > 0 ? `${ip}:3773` : null;
+      } catch {
+        return null;
+      }
+    };
+
+    const server = createServer((req, res) => {
+      const json = (status: number, body: unknown) => {
+        res.writeHead(status, { "content-type": "application/json" });
+        res.end(JSON.stringify(body));
+      };
+      let bodyText = "";
+      req.on("data", (chunk: Buffer) => {
+        bodyText += chunk.toString("utf8");
+      });
+      req.on("end", () => {
+        if (req.method === "POST" && req.url === "/api/v2/oauth/token") {
+          const params = new URLSearchParams(bodyText);
+          if (
+            params.get("client_id") !== OAUTH_CLIENT_ID ||
+            params.get("client_secret") !== OAUTH_CLIENT_SECRET
+          ) {
+            return json(401, { message: "invalid client credentials" });
+          }
+          return json(200, { access_token: accessToken, token_type: "Bearer", expires_in: 3600 });
+        }
+        if (req.headers.authorization !== `Bearer ${accessToken}`) {
+          return json(401, { message: "unauthorized" });
+        }
+        if (req.method === "POST" && req.url === "/api/v2/tailnet/-/keys") {
+          const body = JSON.parse(bodyText) as { description?: string };
+          const hostname = (body.description ?? "").replace(/^t3fleet /, "");
+          hostnames.add(hostname);
+          return json(200, { id: `key-${hostname}`, key: `tskey-auth-${hostname}-fake` });
+        }
+        if (req.method === "GET" && req.url === "/api/v2/tailnet/-/devices") {
+          const devices = [...hostnames].flatMap((hostname) => {
+            const address = containerAddress(hostname);
+            return address === null
+              ? []
+              : [{ id: `1${hostname}`, nodeId: `nodeid-${hostname}`, hostname, name: address }];
+          });
+          return json(200, { devices });
+        }
+        const deviceMatch = req.url?.match(/^\/api\/v2\/device\/([^/]+)$/);
+        if (req.method === "DELETE" && deviceMatch !== null && deviceMatch !== undefined) {
+          const deviceId = decodeURIComponent(deviceMatch[1]!);
+          deletedDeviceIds.push(deviceId);
+          hostnames.delete(deviceId.replace(/^nodeid-/, ""));
+          return json(200, {});
+        }
+        if (req.method === "DELETE" && req.url?.startsWith("/api/v2/tailnet/-/keys/")) {
+          return json(200, {});
+        }
+        return json(404, { message: "not found" });
+      });
+    });
+    server.on("error", reject);
+    server.listen(0, "127.0.0.1", () => {
+      const address = server.address();
+      if (address === null || typeof address === "string") {
+        return reject(new Error("expected tcp address"));
+      }
+      resolve({ url: `http://127.0.0.1:${address.port}`, server, hostnames, deletedDeviceIds });
+    });
+  });
+
+const makeConfig = (dataDir: string, tailscaleApiUrl: string): ControllerConfigShape => ({
   host: "127.0.0.1",
   port: 0,
   dataDir,
@@ -132,9 +237,14 @@ const makeConfig = (dataDir: string): ControllerConfigShape => ({
   statusPollIntervalMillis: 60_000,
   // First boot inside the container runs T3 migrations + project add.
   environmentHealthTimeoutMillis: 120_000,
+  tailscaleApiUrl,
+  tsAuthKeyTtlSeconds: 3600,
+  tailnetJoinTimeoutMillis: 120_000,
+  // The fake tailnet's device names are container bridge IPs (plain HTTP).
+  tailnetEndpointScheme: "http",
 });
 
-const controllerLayer = (dataDir: string) =>
+const controllerLayer = (dataDir: string, tailscaleApiUrl: string) =>
   HttpRouter.serve(Controller.Routes, { disableListenLog: true }).pipe(
     Layer.provideMerge(Controller.Services),
     Layer.provideMerge(Database.layer({ filename: NodePath.join(dataDir, "controller.sqlite") })),
@@ -145,7 +255,7 @@ const controllerLayer = (dataDir: string) =>
         gracefulShutdownTimeout: "250 millis",
       }),
     ),
-    Layer.provideMerge(ControllerConfig.layer(makeConfig(dataDir))),
+    Layer.provideMerge(ControllerConfig.layer(makeConfig(dataDir, tailscaleApiUrl))),
     Layer.provideMerge(NodeSocket.layerWebSocketConstructor),
   );
 
@@ -170,7 +280,6 @@ const runAgent = (input: { readonly stateDir: string; readonly joinToken?: strin
             input.joinToken === undefined
               ? Option.none()
               : Option.some(Redacted.make(input.joinToken)),
-          advertiseHost: Option.some("127.0.0.1"),
           dockerRuntime: "runc",
           snapshotRetention: 2,
           helperImage: "alpine:3.22",
@@ -266,11 +375,15 @@ describe.skipIf(!dockerAvailable)("environment lifecycle (real Docker + real t3)
     const served = await serveBareRepo(bareDir, gateway);
     gitServer = served.server;
     gitUrl = served.url;
+
+    fakeTailscale = await startFakeTailscale();
   }, 900_000);
 
   afterAll(async () => {
     gitServer?.close();
     gitServer?.closeAllConnections();
+    fakeTailscale?.server.close();
+    fakeTailscale?.server.closeAllConnections();
     // Belt and braces: the test destroys its environments; sweep leftovers.
     try {
       const ids = docker([
@@ -313,6 +426,12 @@ describe.skipIf(!dockerAvailable)("environment lifecycle (real Docker + real t3)
           const images = yield* Images;
           yield* images.register({ reference: TEST_IMAGE });
 
+          const settings = yield* TailnetSettings;
+          yield* settings.configure({
+            clientId: OAUTH_CLIENT_ID,
+            clientSecret: Redacted.make(OAUTH_CLIENT_SECRET),
+          });
+
           // --- create two environments for the same repo -----------------
           const environments = yield* Environments;
           const envA = yield* environments.create({ gitUrl, gitBranch: "main" });
@@ -323,9 +442,12 @@ describe.skipIf(!dockerAvailable)("environment lifecycle (real Docker + real t3)
           expect(readyA.error).toBeNull();
           expect(readyB.error).toBeNull();
           expect(readyA.observedState).toBe("running");
-          expect(readyA.endpointUrl).toMatch(/^http:\/\/127\.0\.0\.1:\d+$/);
-          expect(readyB.endpointUrl).toMatch(/^http:\/\/127\.0\.0\.1:\d+$/);
+          // "Tailnet" endpoints: the fake device names are the containers'
+          // bridge IPs — no ports are published on the node anymore.
+          expect(readyA.endpointUrl).toMatch(/^http:\/\/\d+\.\d+\.\d+\.\d+:3773$/);
+          expect(readyB.endpointUrl).toMatch(/^http:\/\/\d+\.\d+\.\d+\.\d+:3773$/);
           expect(readyA.endpointUrl).not.toBe(readyB.endpointUrl);
+          expect(readyA.tailnetDeviceId).toBe(`nodeid-${envA.id}`);
           // Real T3 server identity, straight from the descriptor endpoint.
           expect(readyA.t3EnvironmentId).toBeTruthy();
           expect(readyB.t3EnvironmentId).toBeTruthy();
@@ -400,6 +522,11 @@ describe.skipIf(!dockerAvailable)("environment lifecycle (real Docker + real t3)
           expect(goneA.observedState).toBe("destroyed");
           expect(goneB.observedState).toBe("destroyed");
 
+          // Both tailnet devices were deleted through the API.
+          expect(fakeTailscale!.deletedDeviceIds).toEqual(
+            expect.arrayContaining([`nodeid-${envA.id}`, `nodeid-${envB.id}`]),
+          );
+
           // Nothing remains on the node: no containers, no volumes.
           for (const id of [envA.id, envB.id]) {
             const containers = docker([
@@ -428,7 +555,7 @@ describe.skipIf(!dockerAvailable)("environment lifecycle (real Docker + real t3)
           // The admin sessions are gone from the vault.
           const missing = yield* vault.read(rowA.t3SessionRef!).pipe(Effect.flip);
           expect(missing).toMatchObject({ _tag: "SecretNotFoundError" });
-        }).pipe(Effect.scoped, Effect.provide(controllerLayer(dataDir)));
+        }).pipe(Effect.scoped, Effect.provide(controllerLayer(dataDir, fakeTailscale!.url)));
       }).pipe(Effect.scoped),
     600_000,
   );

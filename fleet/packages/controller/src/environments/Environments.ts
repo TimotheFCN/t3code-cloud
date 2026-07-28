@@ -27,8 +27,9 @@ import { Events } from "../events/Events.ts";
 import { Images } from "../images/Images.ts";
 import { AgentConnections } from "../nodes/AgentConnections.ts";
 import { NodeRegistry } from "../nodes/NodeRegistry.ts";
+import { Tailnet, TailnetNotConfiguredError } from "../tailnet/Tailnet.ts";
 import { Vault } from "../vault/Vault.ts";
-import { nodePortEndpoint } from "./EnvironmentEndpoints.ts";
+import { tailnetEndpoint } from "./EnvironmentEndpoints.ts";
 import {
   type EnvironmentRecordNotFoundError,
   type EnvironmentRow,
@@ -50,9 +51,6 @@ class StepFailure extends Schema.TaggedErrorClass<StepFailure>()("StepFailure", 
   step: Schema.String,
   message: Schema.String,
 }) {}
-
-/** The port the T3 server listens on inside every t3env container. */
-export const T3_CONTAINER_PORT = 3773;
 
 /** Label attached to the controller's admin sessions inside T3 servers. */
 export const CONTROLLER_SESSION_LABEL = "fleet-controller";
@@ -90,7 +88,7 @@ const notFoundIsFine = (error: StepFailure) =>
 
 /**
  * The environment lifecycle machine (`docs/fleet/architecture.md`
- * §Environment Lifecycle, minus the phase-4 tailnet parts).
+ * §Environment Lifecycle).
  *
  * Create runs as persisted, re-runnable steps — side effect first, then the
  * step is recorded — so a controller restarted mid-create resumes from the
@@ -111,7 +109,10 @@ export class Environments extends Context.Service<
       readonly gitBranch?: string | undefined;
       readonly nodeId?: string | undefined;
       readonly name?: string | undefined;
-    }) => Effect.Effect<EnvironmentSummary, NoSchedulableNodeError | NoCurrentImageError>;
+    }) => Effect.Effect<
+      EnvironmentSummary,
+      NoSchedulableNodeError | NoCurrentImageError | TailnetNotConfiguredError
+    >;
     readonly list: Effect.Effect<ReadonlyArray<EnvironmentSummary>>;
     readonly get: (id: string) => Effect.Effect<EnvironmentSummary, EnvironmentRecordNotFoundError>;
     readonly destroy: (
@@ -130,6 +131,7 @@ export class Environments extends Context.Service<
     | Images
     | AgentConnections
     | NodeRegistry
+    | Tailnet
     | Vault
     | EnvironmentsRepo
     | Scheduler
@@ -142,6 +144,7 @@ export class Environments extends Context.Service<
       const images = yield* Images;
       const connections = yield* AgentConnections;
       const registry = yield* NodeRegistry;
+      const tailnet = yield* Tailnet;
       const vault = yield* Vault;
       const repo = yield* EnvironmentsRepo;
       const scheduler = yield* Scheduler;
@@ -245,7 +248,33 @@ export class Environments extends Context.Service<
         yield* decodePulled(payload).pipe(Effect.mapError(stepFail("image-ready")));
       });
 
+      const stepKeyMinted = Effect.fn("Environments.stepKeyMinted")(function* (
+        row: EnvironmentRow,
+      ) {
+        // Never mint a second key for an environment that already has one:
+        // a re-run (crash between the vault write and the step record, or
+        // reconciliation) reuses the recorded key — the device identity on
+        // the volume is what must stay stable.
+        if (row.tsAuthKeyRef !== null) {
+          return;
+        }
+        const minted = yield* tailnet
+          .mintAuthKey(row.id)
+          .pipe(Effect.mapError(stepFail("key-minted")));
+        const keyRef = yield* vault.store(minted.key).pipe(Effect.mapError(stepFail("key-minted")));
+        yield* repo.setTailnetKey({ id: row.id, keyRef, keyId: minted.keyId });
+      });
+
       const stepCreated = Effect.fn("Environments.stepCreated")(function* (row: EnvironmentRow) {
+        if (row.tsAuthKeyRef === null) {
+          return yield* new StepFailure({
+            step: "created",
+            message: "no minted tailnet auth key recorded",
+          });
+        }
+        const authKey = yield* vault
+          .read(row.tsAuthKeyRef)
+          .pipe(Effect.mapError(stepFail("created")));
         yield* request(
           row.nodeId,
           {
@@ -257,8 +286,15 @@ export class Environments extends Context.Service<
               env: {
                 T3ENV_GIT_URL: row.gitUrl,
                 ...(row.gitBranch === null ? {} : { T3ENV_GIT_BRANCH: row.gitBranch }),
+                // The environment joins the tailnet as `env-<id>` and lets
+                // Tailscale Serve publish the T3 server over HTTPS. The auth
+                // key rides the create spec as an env var — a documented
+                // stopgap until phase 5's sealed credential injection (it is
+                // single-use, short-lived, and never logged).
+                T3ENV_TS_HOSTNAME: row.id,
+                TS_AUTHKEY: Redacted.value(authKey),
+                T3CODE_TAILSCALE_SERVE: "1",
               },
-              publishPorts: [{ containerPort: T3_CONTAINER_PORT }],
             },
           },
           "created",
@@ -273,30 +309,67 @@ export class Environments extends Context.Service<
           "started",
           "1 minute",
         );
-        const descriptor = yield* decodeDescriptorPayload(payload).pipe(
-          Effect.mapError(stepFail("started")),
+        yield* decodeDescriptorPayload(payload).pipe(Effect.mapError(stepFail("started")));
+      });
+
+      const stepTailnetJoined = Effect.fn("Environments.stepTailnetJoined")(function* (
+        row: EnvironmentRow,
+      ) {
+        yield* repo.setStatusDetail(row.id, "waiting for the environment to join the tailnet");
+        const device = yield* tailnet.findDevice(row.id).pipe(
+          // Transient API failures must not abort the wait; a missing OAuth
+          // configuration is permanent and fails immediately.
+          Effect.retry({
+            while: (error) => error._tag === "TailscaleApiError",
+            schedule: Schedule.spaced("2 seconds"),
+          }),
+          Effect.repeat({
+            until: Option.isSome,
+            schedule: Schedule.spaced("2 seconds"),
+          }),
+          Effect.timeoutOrElse({
+            duration: Duration.millis(config.tailnetJoinTimeoutMillis),
+            orElse: () =>
+              new StepFailure({
+                step: "tailnet-joined",
+                message:
+                  `device ${row.id} did not appear on the tailnet within ` +
+                  `${config.tailnetJoinTimeoutMillis}ms — check the container logs on the node ` +
+                  `and the tailnet ACL/tag configuration`,
+              }),
+          }),
+          Effect.mapError((error) =>
+            error instanceof StepFailure ? error : stepFail("tailnet-joined")(error),
+          ),
         );
-        const hostPort = descriptor.ports?.find(
-          (port) => port.containerPort === T3_CONTAINER_PORT,
-        )?.hostPort;
-        if (hostPort === undefined) {
-          return yield* new StepFailure({
-            step: "started",
-            message: `no host port published for container port ${T3_CONTAINER_PORT}`,
-          });
+        if (Option.isNone(device)) {
+          // Unreachable (repeat runs until Some), but keeps the types honest.
+          return yield* new StepFailure({ step: "tailnet-joined", message: "no device found" });
         }
-        const host = yield* registry.endpointHost(row.nodeId);
-        if (Option.isNone(host)) {
-          return yield* new StepFailure({
-            step: "started",
-            message: `no endpoint host recorded for node ${row.nodeId}`,
-          });
-        }
-        yield* repo.setEndpoint({
+        yield* repo.setTailnetDevice({
           id: row.id,
-          hostPort,
-          endpointUrl: nodePortEndpoint(host.value, hostPort),
+          deviceId: device.value.deviceId,
+          endpointUrl: tailnetEndpoint(config.tailnetEndpointScheme, device.value.name),
         });
+        // The single-use key is consumed — remove every trace of it. The
+        // Tailscale-side deletion is cosmetic (the key cannot be reused), so
+        // it is best-effort.
+        if (row.tsAuthKeyId !== null) {
+          yield* tailnet
+            .deleteAuthKey(row.tsAuthKeyId)
+            .pipe(
+              Effect.catch((error) =>
+                Effect.logWarning(
+                  `environment ${row.id}: auth-key cleanup failed: ${error.message}`,
+                ),
+              ),
+            );
+        }
+        if (row.tsAuthKeyRef !== null) {
+          yield* vault.delete(row.tsAuthKeyRef).pipe(Effect.mapError(stepFail("tailnet-joined")));
+        }
+        yield* repo.clearTailnetKey(row.id);
+        yield* repo.setStatusDetail(row.id, null);
       });
 
       const stepHealthy = Effect.fn("Environments.stepHealthy")(function* (row: EnvironmentRow) {
@@ -304,9 +377,16 @@ export class Environments extends Context.Service<
         if (fresh.endpointUrl === null) {
           return yield* new StepFailure({ step: "healthy", message: "no endpoint URL recorded" });
         }
-        // The entrypoint clones, runs the setup hook, and registers the
-        // project before `t3 serve` starts — a healthy descriptor implies the
-        // whole bootstrap sequence succeeded.
+        // Tailscale Serve provisions the HTTPS certificate lazily; the first
+        // request can take up to a minute. Surface the wait instead of
+        // failing early.
+        yield* repo.setStatusDetail(
+          row.id,
+          "waiting for the T3 server to answer over the tailnet (HTTPS certificate issuance can take a minute)",
+        );
+        // The entrypoint joins the tailnet, clones, runs the setup hook, and
+        // registers the project before `t3 serve` starts — a healthy
+        // descriptor implies the whole bootstrap sequence succeeded.
         const descriptor = yield* fetchDescriptor(httpClient, fresh.endpointUrl).pipe(
           Effect.retry({
             while: (error) => error._tag === "T3RequestError",
@@ -317,7 +397,7 @@ export class Environments extends Context.Service<
             orElse: () =>
               new StepFailure({
                 step: "healthy",
-                message: `T3 server did not become healthy within ${config.environmentHealthTimeoutMillis}ms (check container logs on the node)`,
+                message: `T3 server did not become healthy within ${config.environmentHealthTimeoutMillis}ms (check container logs on the node; HTTPS certificate issuance requires MagicDNS + HTTPS to be enabled on the tailnet)`,
               }),
           }),
           Effect.mapError((error) =>
@@ -325,6 +405,7 @@ export class Environments extends Context.Service<
           ),
         );
         yield* repo.setT3Identity({ id: row.id, t3EnvironmentId: descriptor.environmentId });
+        yield* repo.setStatusDetail(row.id, null);
       });
 
       const stepSessionIssued = Effect.fn("Environments.stepSessionIssued")(function* (
@@ -394,6 +475,11 @@ export class Environments extends Context.Service<
                 break;
               }
               case "image-ready": {
+                yield* stepKeyMinted(row);
+                yield* repo.setCreateStep(id, "key-minted");
+                break;
+              }
+              case "key-minted": {
                 yield* stepCreated(row);
                 yield* repo.setCreateStep(id, "created");
                 break;
@@ -404,6 +490,11 @@ export class Environments extends Context.Service<
                 break;
               }
               case "started": {
+                yield* stepTailnetJoined(row);
+                yield* repo.setCreateStep(id, "tailnet-joined");
+                break;
+              }
+              case "tailnet-joined": {
                 yield* stepHealthy(row);
                 yield* repo.setCreateStep(id, "healthy");
                 break;
@@ -468,6 +559,55 @@ export class Environments extends Context.Service<
         yield* Effect.logInfo(`environment ${row.id}: archived uncommitted work to ${path}`);
       });
 
+      /**
+       * Removes the environment's tailnet footprint: the device (hard step —
+       * a failure fails the destroy, which reconciliation retries) and any
+       * leftover minted-but-unused auth key (best-effort on the Tailscale
+       * side, hard for the vault copy). An unconfigured tailnet only warns:
+       * without the OAuth client there is nothing the controller can do.
+       */
+      const cleanupTailnet = Effect.fn("Environments.cleanupTailnet")(function* (
+        row: EnvironmentRow,
+      ) {
+        const isConfigured = yield* tailnet.configured;
+        if (row.tsAuthKeyId !== null && isConfigured) {
+          yield* tailnet
+            .deleteAuthKey(row.tsAuthKeyId)
+            .pipe(
+              Effect.catch((error) =>
+                Effect.logWarning(
+                  `environment ${row.id}: auth-key cleanup failed: ${error.message}`,
+                ),
+              ),
+            );
+        }
+        if (row.tsAuthKeyRef !== null) {
+          yield* vault.delete(row.tsAuthKeyRef).pipe(Effect.mapError(stepFail("delete-device")));
+          yield* repo.clearTailnetKey(row.id);
+        }
+        if (!isConfigured) {
+          if (row.tailnetDeviceId !== null) {
+            yield* Effect.logWarning(
+              `environment ${row.id}: cannot delete tailnet device ${row.tailnetDeviceId} — Tailscale is not configured`,
+            );
+          }
+          return;
+        }
+        // Destroys that never reached `tailnet-joined` may still have joined
+        // (crash between join and record) — fall back to a hostname lookup.
+        let deviceId = row.tailnetDeviceId;
+        if (deviceId === null) {
+          const found = yield* tailnet
+            .findDevice(row.id)
+            .pipe(Effect.mapError(stepFail("delete-device")));
+          deviceId = Option.isSome(found) ? found.value.deviceId : null;
+        }
+        if (deviceId !== null) {
+          yield* tailnet.deleteDevice(deviceId).pipe(Effect.mapError(stepFail("delete-device")));
+          yield* Effect.logInfo(`environment ${row.id}: tailnet device ${deviceId} deleted`);
+        }
+      });
+
       const runDestroy = Effect.fn("Environments.runDestroy")(function* (id: string) {
         const outcome = yield* Effect.gen(function* () {
           const row = yield* repo.get(id).pipe(Effect.mapError(stepFail("load")));
@@ -510,6 +650,8 @@ export class Environments extends Context.Service<
             "2 minutes",
           ).pipe(Effect.asVoid, Effect.catch(notFoundIsFine));
 
+          yield* cleanupTailnet(row);
+
           if (row.t3SessionRef !== null) {
             yield* vault.delete(row.t3SessionRef).pipe(Effect.mapError(stepFail("destroy")));
             yield* repo.clearSession(id);
@@ -545,6 +687,15 @@ export class Environments extends Context.Service<
         readonly nodeId?: string | undefined;
         readonly name?: string | undefined;
       }) {
+        // Fail fast: without an OAuth client the key-minted step can never
+        // succeed, so reject the create before anything is persisted.
+        const tailnetConfigured = yield* tailnet.configured;
+        if (!tailnetConfigured) {
+          return yield* new TailnetNotConfiguredError({
+            message:
+              "Tailscale is not configured — provide an OAuth client via PUT /api/settings/tailscale first",
+          });
+        }
         const image = yield* images.current;
         if (Option.isNone(image)) {
           return yield* new NoCurrentImageError({

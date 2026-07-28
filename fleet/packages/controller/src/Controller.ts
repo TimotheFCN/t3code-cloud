@@ -22,6 +22,8 @@ import { Images } from "./images/Images.ts";
 import { AgentConnections } from "./nodes/AgentConnections.ts";
 import { JoinTokens } from "./nodes/JoinTokens.ts";
 import { NodeRegistry } from "./nodes/NodeRegistry.ts";
+import { Tailnet } from "./tailnet/Tailnet.ts";
+import { TailnetSettings } from "./tailnet/TailnetSettings.ts";
 import { Vault } from "./vault/Vault.ts";
 
 /** HTTP API routes plus the agent WebSocket endpoint. */
@@ -38,8 +40,12 @@ export const Services = Layer.mergeAll(
   StatusPoller.layer,
 ).pipe(
   Layer.provideMerge(Scheduler.layer),
-  Layer.provideMerge(Layer.mergeAll(NodeRegistry.layer, Images.layer, EnvironmentsRepo.layer)),
-  Layer.provideMerge(Layer.mergeAll(JoinTokens.layer, Events.layer, AgentConnections.layer)),
+  Layer.provideMerge(
+    Layer.mergeAll(NodeRegistry.layer, Images.layer, EnvironmentsRepo.layer, Tailnet.layer),
+  ),
+  Layer.provideMerge(
+    Layer.mergeAll(JoinTokens.layer, Events.layer, AgentConnections.layer, TailnetSettings.layer),
+  ),
   Layer.provideMerge(Layer.mergeAll(Vault.layer, FetchHttpClient.layer)),
 );
 

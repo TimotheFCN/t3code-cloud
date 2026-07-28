@@ -31,13 +31,13 @@ Updating a bundled dependency is a one-line ARG bump, `./build.sh`, and a push.
 The driver mounts one named volume per environment at **`/root`**. Everything an environment must
 keep across image updates lives inside it:
 
-| Path                 | Contents                                                          |
-| -------------------- | ----------------------------------------------------------------- |
-| `/root/.t3`          | `T3CODE_HOME`: threads, sessions, project registry, auth database |
-| `/root/.docker-data` | inner Docker data root (`/etc/docker/daemon.json`)                |
-| `/root/workspace`    | project clone (created in phase 3)                                |
-| `/root/.tailscale`   | tailscaled state — stable device identity (created in phase 4)    |
-| `/root/.claude` etc. | provider CLI state, injected/synced by the vault (phase 5)        |
+| Path                 | Contents                                                                                                                                                        |
+| -------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `/root/.t3`          | `T3CODE_HOME`: threads, sessions, project registry, auth database                                                                                               |
+| `/root/.docker-data` | inner Docker data root (`/etc/docker/daemon.json`)                                                                                                              |
+| `/root/workspace`    | project clone                                                                                                                                                   |
+| `/root/.tailscale`   | tailscaled state — the device identity that keeps the environment's `https://env-<id>.<tailnet>.ts.net` URL stable across restarts, suspends, and image updates |
+| `/root/.claude` etc. | provider CLI state, injected/synced by the vault (phase 5)                                                                                                      |
 
 Everything **outside** `/root` — including `apt` installs made during a session — is legitimately
 lost when the container is recreated with a newer image. That is why every binary in this image
@@ -48,30 +48,42 @@ The inner Docker data root deliberately lives on the volume (a real host filesys
 persists inner images/containers and sidesteps overlayfs-on-overlayfs; sysbox's special handling
 of `/var/lib/docker` is not needed.
 
-## Entrypoint (phase-3 bootstrap)
+## Entrypoint
 
 `entrypoint.sh` runs the bootstrap sequence on every container boot:
 
-1. Start the inner `dockerd` (waits up to 30s for the socket; warns and continues without it when
+1. **Tailnet join** (when `T3ENV_TS_HOSTNAME` is set and `T3ENV_SKIP_TAILSCALE` is not `1`):
+   start `tailscaled` with its state in `/root/.tailscale` (on the volume — stable device
+   identity), in userspace-networking mode when `/dev/net/tun` is absent (sysbox exposes it, so
+   production environments use kernel TUN). On the very first boot the join consumes the
+   controller-minted single-use `TS_AUTHKEY`; every later boot detects the existing logged-in
+   identity and rejoins **without any key** — the device (and its URL) is the same for life. A
+   failed join aborts the boot loudly, and `TS_AUTHKEY` is unset before anything else starts.
+2. Start the inner `dockerd` (waits up to 30s for the socket; warns and continues without it when
    the runtime cannot support it, e.g. plain `runc` in development). `T3ENV_SKIP_DOCKERD=1` skips
    it (useful in tests).
-2. Clone `T3ENV_GIT_URL` (optionally `--branch T3ENV_GIT_BRANCH`) into `/root/workspace` — only
+3. Clone `T3ENV_GIT_URL` (optionally `--branch T3ENV_GIT_BRANCH`) into `/root/workspace` — only
    when the volume does not already contain a clone, so recreates and restarts never touch an
    existing workspace.
-3. Run the **setup hook** when the repo defines one: an executable `.t3env/setup.sh` at the repo
+4. Run the **setup hook** when the repo defines one: an executable `.t3env/setup.sh` at the repo
    root, executed from the workspace on every boot. It must be idempotent; this is where projects
    reinstall apt packages and other root-filesystem state that image updates legitimately lose. A
    failing hook aborts the boot loudly.
-4. `t3 project add /root/workspace` (an already-registered workspace counts as success —
+5. `t3 project add /root/workspace` (an already-registered workspace counts as success —
    `T3CODE_HOME` lives on the volume).
-5. `t3 serve`, configured purely through `T3CODE_*` env vars. Image defaults:
+6. `t3 serve`, configured purely through `T3CODE_*` env vars — the controller sets
+   `T3CODE_TAILSCALE_SERVE=1` so the server publishes itself at
+   `https://<hostname>.<tailnet>.ts.net/` through Tailscale Serve (the certificate is issued on
+   first request and cached in the tailscaled state on the volume). Image defaults:
 
 ```text
 T3CODE_HOST=0.0.0.0  T3CODE_PORT=3773  T3CODE_HOME=/root/.t3  T3CODE_NO_BROWSER=1
 ```
 
-Steps 2–4 are skipped entirely when `T3ENV_GIT_URL` is unset. Phase 4 prepends the tailnet join;
-phase 5 adds credential materialization before the clone.
+Steps 3–5 are skipped entirely when `T3ENV_GIT_URL` is unset. Phase 5 adds credential
+materialization before the clone. Test-only overrides (`T3ENV_TS_STATE_DIR`, `T3ENV_TS_SOCKET`,
+`T3ENV_TUN_DEVICE`, `T3ENV_LOG_DIR`) let `entrypoint.test.ts` exercise the join logic with
+stubbed binaries outside a container; production never sets them.
 
 ## Building and pushing
 

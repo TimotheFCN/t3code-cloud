@@ -3,7 +3,6 @@ import type {
   EnvironmentDescriptor,
   EnvironmentState,
   ExecResult,
-  PortBinding,
 } from "@t3fleet/shared/environment";
 import * as Clock from "effect/Clock";
 import * as Effect from "effect/Effect";
@@ -13,18 +12,12 @@ import { Driver, DriverError, EnvironmentNotFoundError } from "./Driver.ts";
 
 export interface FakeDriverOptions {
   /**
-   * Resolves the host port for a published container port (the docker
-   * driver's ephemeral-port behavior). Defaults to the container port
-   * itself. Lifecycle tests point this at a real local test server.
-   */
-  readonly resolveHostPort?: (containerPort: number) => number;
-  /**
    * Overrides exec results per command; returning `undefined` falls back to
    * the default echo behavior. Lifecycle tests emulate `t3 auth ...` output
    * with this.
    */
   readonly exec?: (environmentId: string, command: ReadonlyArray<string>) => ExecResult | undefined;
-  /** Observes every create spec (tests assert env vars / port publications). */
+  /** Observes every create spec (tests assert env vars). */
   readonly onCreate?: (spec: CreateEnvironmentSpec) => void;
 }
 
@@ -32,14 +25,13 @@ interface FakeEnvironment {
   name: string;
   image: string;
   state: EnvironmentState;
-  publishPorts: ReadonlyArray<PortBinding>;
 }
 
 /**
  * In-memory driver used by tests (and as placeholder wiring where no Docker
  * daemon exists). Mirrors the docker driver's contract: created -> running ->
  * stopped, destroy removes, create adopts an existing id, restore requires a
- * stopped environment, published ports resolve while running.
+ * stopped environment.
  *
  * `makeService` builds a standalone service value whose state outlives layer
  * builds — tests reuse one across "agent restarts" the way real nodes keep
@@ -47,23 +39,14 @@ interface FakeEnvironment {
  */
 export const makeService = (options: FakeDriverOptions = {}): Driver["Service"] => {
   const environments = new Map<string, FakeEnvironment>();
-  const resolveHostPort = options.resolveHostPort ?? ((containerPort: number) => containerPort);
 
   const descriptor = (id: string): EnvironmentDescriptor => {
     const entry = environments.get(id)!;
-    const ports =
-      entry.state === "running"
-        ? entry.publishPorts.map((port) => ({
-            containerPort: port.containerPort,
-            hostPort: port.hostPort ?? resolveHostPort(port.containerPort),
-          }))
-        : [];
     return {
       id,
       name: entry.name,
       image: entry.image,
       state: entry.state,
-      ...(ports.length > 0 ? { ports } : {}),
     };
   };
 
@@ -87,7 +70,6 @@ export const makeService = (options: FakeDriverOptions = {}): Driver["Service"] 
           name: spec.name,
           image: spec.image,
           state: "created",
-          publishPorts: spec.publishPorts ?? [],
         });
       }
       return descriptor(spec.id);

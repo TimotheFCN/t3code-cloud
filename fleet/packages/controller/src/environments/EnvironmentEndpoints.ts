@@ -1,14 +1,14 @@
 /**
  * The single seam where environment endpoint URLs are built.
  *
- * Phase 3 reaches environments through a node-port mapping
- * (`http://<node-host>:<host-port>`). Phase 4 replaces this construction with
- * per-environment tailnet HTTPS URLs (`https://env-<id>.<tailnet>.ts.net`)
- * and deletes the node-port path; everything else consumes the persisted
- * `endpoint_url` and needs no change.
+ * Every environment is its own tailnet device; its endpoint is the MagicDNS
+ * HTTPS URL derived from the device name the Tailscale API reports after the
+ * first join (`https://env-<id>.<tailnet>.ts.net`). The scheme is
+ * configurable only so integration tests can fake the tailnet with plain
+ * HTTP — production is always `https`.
  */
-export const nodePortEndpoint = (host: string, hostPort: number): string =>
-  host.includes(":") ? `http://[${host}]:${hostPort}` : `http://${host}:${hostPort}`;
+export const tailnetEndpoint = (scheme: "https" | "http", deviceName: string): string =>
+  `${scheme}://${deviceName.replace(/\.$/, "").toLowerCase()}`;
 
 /** `<origin>/pair#token=<credential>` — upstream's pairing URL format. */
 export const pairingUrl = (endpointUrl: string, credential: string): string =>

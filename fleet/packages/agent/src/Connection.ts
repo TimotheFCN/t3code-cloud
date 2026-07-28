@@ -76,7 +76,6 @@ export const run = Effect.gen(function* () {
     kind: "hello",
     protocolVersion: PROTOCOL_VERSION,
     nodeName: config.nodeName,
-    ...(Option.isSome(config.advertiseHost) ? { endpointHost: config.advertiseHost.value } : {}),
   } as const;
 
   const buildHello = Effect.gen(function* () {

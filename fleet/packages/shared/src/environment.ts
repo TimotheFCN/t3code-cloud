@@ -8,17 +8,6 @@ import * as Schema from "effect/Schema";
 export const EnvironmentState = Schema.Literals(["created", "running", "stopped"]);
 export type EnvironmentState = typeof EnvironmentState.Type;
 
-/**
- * A container-port-to-host-port publication. `hostPort` is omitted in a
- * create spec to let the runtime pick an ephemeral port; descriptors of
- * running environments carry the resolved value.
- */
-export const PortBinding = Schema.Struct({
-  containerPort: Schema.Int,
-  hostPort: Schema.optional(Schema.Int),
-});
-export type PortBinding = typeof PortBinding.Type;
-
 export const EnvironmentDescriptor = Schema.Struct({
   id: Schema.String,
   name: Schema.String,
@@ -27,22 +16,20 @@ export const EnvironmentDescriptor = Schema.Struct({
   /** Runtime identifiers, present when a real container backs the environment. */
   containerId: Schema.optional(Schema.String),
   volumeName: Schema.optional(Schema.String),
-  /** Resolved port publications; only populated while the container runs. */
-  ports: Schema.optional(Schema.Array(PortBinding)),
 });
 export type EnvironmentDescriptor = typeof EnvironmentDescriptor.Type;
 
 /**
- * What the controller sends to create an environment. Env vars and port
- * publications are the phase-3 hooks (T3CODE_* config, node-port access
- * until the phase-4 tailnet takes over).
+ * What the controller sends to create an environment. Env vars are the
+ * configuration hook (`T3CODE_*` server config, `T3ENV_*` bootstrap inputs,
+ * `TS_AUTHKEY` for the tailnet join). Environments are reached over their
+ * own tailnet HTTPS endpoint — no ports are published on the node.
  */
 export const CreateEnvironmentSpec = Schema.Struct({
   id: Schema.String,
   name: Schema.String,
   image: Schema.String,
   env: Schema.optional(Schema.Record(Schema.String, Schema.String)),
-  publishPorts: Schema.optional(Schema.Array(PortBinding)),
 });
 export type CreateEnvironmentSpec = typeof CreateEnvironmentSpec.Type;
 
@@ -85,8 +72,10 @@ export type EnvironmentDesiredState = typeof EnvironmentDesiredState.Type;
 export const EnvironmentCreateStep = Schema.Literals([
   "scheduled",
   "image-ready",
+  "key-minted",
   "created",
   "started",
+  "tailnet-joined",
   "healthy",
   "session-issued",
   "ready",
@@ -136,12 +125,20 @@ export const EnvironmentSummary = Schema.Struct({
   createStep: EnvironmentCreateStep,
   observedState: EnvironmentObservedState,
   /**
-   * Base URL clients reach the T3 server at. Node-port (`http://host:port`)
-   * in phase 3; phase 4 swaps in the tailnet HTTPS URL.
+   * Base URL clients reach the T3 server at: the environment's own tailnet
+   * HTTPS endpoint (`https://env-<id>.<tailnet>.ts.net`), recorded once the
+   * device appears on the tailnet.
    */
   endpointUrl: Schema.NullOr(Schema.String),
+  /** Tailscale device id backing the endpoint (deleted on destroy). */
+  tailnetDeviceId: Schema.NullOr(Schema.String),
   /** The T3 server's own environment id, from the descriptor endpoint. */
   t3EnvironmentId: Schema.NullOr(Schema.String),
+  /**
+   * Human-readable progress note for slow mid-create waits (e.g. HTTPS
+   * certificate issuance); null outside those windows.
+   */
+  statusDetail: Schema.NullOr(Schema.String),
   activity: Schema.NullOr(EnvironmentActivity),
   lastStatusAtMillis: Schema.NullOr(Schema.Number),
   error: Schema.NullOr(Schema.String),

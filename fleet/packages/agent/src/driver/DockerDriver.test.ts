@@ -50,7 +50,6 @@ const makeConfig = (overrides?: Partial<AgentConfigShape>): AgentConfigShape => 
   nodeName: "driver-test-node",
   stateDir,
   joinToken: Option.none(),
-  advertiseHost: Option.none(),
   dockerRuntime: "runc",
   snapshotRetention: 2,
   helperImage: HELPER_IMAGE,
@@ -96,7 +95,7 @@ describe.skipIf(!dockerAvailable)("DockerDriver (real Docker)", () => {
   });
 
   it.live(
-    "runs the full lifecycle with labels, env vars, and published ports",
+    "runs the full lifecycle with labels and env vars",
     () =>
       Effect.gen(function* () {
         const driver = yield* Driver;
@@ -107,7 +106,6 @@ describe.skipIf(!dockerAvailable)("DockerDriver (real Docker)", () => {
           name: "lifecycle-env",
           image: TEST_IMAGE,
           env: { T3FLEET_TEST_VALUE: "hello-fleet" },
-          publishPorts: [{ containerPort: 8080 }],
         });
         expect(created.id).toBe(id);
         expect(created.name).toBe("lifecycle-env");
@@ -122,9 +120,6 @@ describe.skipIf(!dockerAvailable)("DockerDriver (real Docker)", () => {
 
         const started = yield* driver.startEnvironment(id);
         expect(started.state).toBe("running");
-        // An ephemeral host port was resolved for the published container port.
-        const binding = started.ports?.find((port) => port.containerPort === 8080);
-        expect(binding?.hostPort).toBeGreaterThan(0);
 
         // Env vars injected at create reach processes inside.
         const env = yield* driver.execInEnvironment(id, ["printenv", "T3FLEET_TEST_VALUE"]);

@@ -5,7 +5,6 @@ import type {
   CreateEnvironmentSpec,
   EnvironmentDescriptor,
   EnvironmentState,
-  PortBinding,
 } from "@t3fleet/shared/environment";
 import * as Clock from "effect/Clock";
 import * as Effect from "effect/Effect";
@@ -40,22 +39,12 @@ export const volumeName = (environmentId: string) => `t3env-${environmentId}-hom
 
 // --- docker CLI output shapes (only the fields the driver reads) -------------
 
-const PortBindingJson = Schema.Struct({
-  HostIp: Schema.optional(Schema.String),
-  HostPort: Schema.String,
-});
-
 const ContainerInspectJson = Schema.Struct({
   Id: Schema.String,
   State: Schema.Struct({ Status: Schema.String }),
   Config: Schema.Struct({
     Image: Schema.String,
     Labels: Schema.NullOr(Schema.Record(Schema.String, Schema.String)),
-  }),
-  NetworkSettings: Schema.Struct({
-    Ports: Schema.NullOr(
-      Schema.Record(Schema.String, Schema.NullOr(Schema.Array(PortBindingJson))),
-    ),
   }),
 });
 type ContainerInspectJson = typeof ContainerInspectJson.Type;
@@ -85,23 +74,6 @@ const toEnvironmentState = (status: string): EnvironmentState => {
   }
 };
 
-const toPorts = (inspect: ContainerInspectJson): Array<PortBinding> => {
-  const ports: Array<PortBinding> = [];
-  for (const [key, bindings] of Object.entries(inspect.NetworkSettings.Ports ?? {})) {
-    const containerPort = Number.parseInt(key, 10);
-    const hostPort = bindings?.[0]?.HostPort;
-    if (!Number.isInteger(containerPort)) {
-      continue;
-    }
-    ports.push(
-      hostPort === undefined
-        ? { containerPort }
-        : { containerPort, hostPort: Number.parseInt(hostPort, 10) },
-    );
-  }
-  return ports;
-};
-
 const decodeAs =
   <A, E>(operation: string, decode: (input: string) => Effect.Effect<A, E>) =>
   (input: string) =>
@@ -118,7 +90,6 @@ const decodeAs =
 
 const toDescriptor = (inspect: ContainerInspectJson): EnvironmentDescriptor => {
   const labels = inspect.Config.Labels ?? {};
-  const ports = toPorts(inspect);
   return {
     id: labels[Labels.environmentId] ?? "",
     name: labels[Labels.environmentName] ?? "",
@@ -126,7 +97,6 @@ const toDescriptor = (inspect: ContainerInspectJson): EnvironmentDescriptor => {
     state: toEnvironmentState(inspect.State.Status),
     containerId: inspect.Id,
     volumeName: labels[Labels.volumeName],
-    ...(ports.length > 0 ? { ports } : {}),
   };
 };
 
@@ -341,12 +311,6 @@ export const layer = Layer.effect(
         "-e",
         `${key}=${value}`,
       ]);
-      const portFlags = (spec.publishPorts ?? []).flatMap((port) => [
-        "-p",
-        port.hostPort === undefined
-          ? `${port.containerPort}`
-          : `${port.hostPort}:${port.containerPort}`,
-      ]);
 
       const containerId = yield* docker("createEnvironment", [
         "container",
@@ -368,7 +332,6 @@ export const layer = Layer.effect(
         "--mount",
         `type=volume,src=${volume},dst=${HOME_MOUNT_PATH}`,
         ...envFlags,
-        ...portFlags,
         spec.image,
       ]);
 

@@ -27,6 +27,22 @@ export interface ControllerConfigShape {
   readonly statusPollIntervalMillis: number;
   /** How long a create waits for the T3 server to answer its descriptor. */
   readonly environmentHealthTimeoutMillis: number;
+  /** Tailscale control API base URL (tests point this at a fake). */
+  readonly tailscaleApiUrl: string;
+  /**
+   * Expiry of minted per-environment auth keys. Short by design: a key is
+   * consumed by the first join and deleted right after; it only needs to
+   * outlive image pull + container start.
+   */
+  readonly tsAuthKeyTtlSeconds: number;
+  /** How long a create waits for the environment to appear on the tailnet. */
+  readonly tailnetJoinTimeoutMillis: number;
+  /**
+   * Scheme of environment endpoint URLs built from tailnet device names.
+   * Always `https` in production (Tailscale Serve publishes HTTPS only);
+   * `http` exists solely for integration tests that fake the tailnet.
+   */
+  readonly tailnetEndpointScheme: "https" | "http";
 }
 
 export const defaults: ControllerConfigShape = {
@@ -37,7 +53,13 @@ export const defaults: ControllerConfigShape = {
   joinTokenTtlSeconds: 900,
   statusPollIntervalMillis: 15_000,
   environmentHealthTimeoutMillis: 180_000,
+  tailscaleApiUrl: "https://api.tailscale.com",
+  tsAuthKeyTtlSeconds: 3600,
+  tailnetJoinTimeoutMillis: 180_000,
+  tailnetEndpointScheme: "https",
 };
+
+const EndpointScheme = Schema.Literals(["https", "http"]);
 
 const ConfigFile = Schema.Struct({
   host: Schema.optional(Schema.String),
@@ -47,6 +69,10 @@ const ConfigFile = Schema.Struct({
   joinTokenTtlSeconds: Schema.optional(Schema.Int),
   statusPollIntervalMillis: Schema.optional(Schema.Int),
   environmentHealthTimeoutMillis: Schema.optional(Schema.Int),
+  tailscaleApiUrl: Schema.optional(Schema.String),
+  tsAuthKeyTtlSeconds: Schema.optional(Schema.Int),
+  tailnetJoinTimeoutMillis: Schema.optional(Schema.Int),
+  tailnetEndpointScheme: Schema.optional(EndpointScheme),
 });
 
 const decodeConfigFile = Schema.decodeUnknownEffect(Schema.fromJsonString(ConfigFile));
@@ -98,6 +124,19 @@ export class ControllerConfig extends Context.Service<ControllerConfig, Controll
         environmentHealthTimeoutMillis: yield* Config.int(
           "FLEET_CONTROLLER_ENVIRONMENT_HEALTH_TIMEOUT_MS",
         ).pipe(Config.option),
+        tailscaleApiUrl: yield* Config.string("FLEET_CONTROLLER_TAILSCALE_API_URL").pipe(
+          Config.option,
+        ),
+        tsAuthKeyTtlSeconds: yield* Config.int("FLEET_CONTROLLER_TS_AUTHKEY_TTL_SECONDS").pipe(
+          Config.option,
+        ),
+        tailnetJoinTimeoutMillis: yield* Config.int(
+          "FLEET_CONTROLLER_TAILNET_JOIN_TIMEOUT_MS",
+        ).pipe(Config.option),
+        tailnetEndpointScheme: yield* Config.literals(
+          ["https", "http"],
+          "FLEET_CONTROLLER_TAILNET_ENDPOINT_SCHEME",
+        ).pipe(Config.option),
       };
       return ControllerConfig.of({
         host: Option.getOrElse(env.host, () => fromFile.host ?? defaults.host),
@@ -118,6 +157,22 @@ export class ControllerConfig extends Context.Service<ControllerConfig, Controll
         environmentHealthTimeoutMillis: Option.getOrElse(
           env.environmentHealthTimeoutMillis,
           () => fromFile.environmentHealthTimeoutMillis ?? defaults.environmentHealthTimeoutMillis,
+        ),
+        tailscaleApiUrl: Option.getOrElse(
+          env.tailscaleApiUrl,
+          () => fromFile.tailscaleApiUrl ?? defaults.tailscaleApiUrl,
+        ),
+        tsAuthKeyTtlSeconds: Option.getOrElse(
+          env.tsAuthKeyTtlSeconds,
+          () => fromFile.tsAuthKeyTtlSeconds ?? defaults.tsAuthKeyTtlSeconds,
+        ),
+        tailnetJoinTimeoutMillis: Option.getOrElse(
+          env.tailnetJoinTimeoutMillis,
+          () => fromFile.tailnetJoinTimeoutMillis ?? defaults.tailnetJoinTimeoutMillis,
+        ),
+        tailnetEndpointScheme: Option.getOrElse(
+          env.tailnetEndpointScheme,
+          () => fromFile.tailnetEndpointScheme ?? defaults.tailnetEndpointScheme,
         ),
       });
     }),
