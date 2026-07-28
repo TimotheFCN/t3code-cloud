@@ -4,6 +4,7 @@ import { describe, expect, it } from "vite-plus/test";
 
 import {
   buildThreadListV2Items,
+  resolveThreadListV2Enabled,
   resolveThreadListV2Status,
   sortThreadsForListV2,
 } from "./threadListV2";
@@ -37,6 +38,25 @@ function makeThread(
 }
 
 const NOW = "2026-06-02T00:00:00.000Z";
+
+describe("resolveThreadListV2Enabled", () => {
+  it("defaults on when the device has never chosen", () => {
+    expect(resolveThreadListV2Enabled({ preference: undefined, preferencesLoaded: true })).toBe(
+      true,
+    );
+  });
+
+  it("honors an explicit device opt-out", () => {
+    expect(resolveThreadListV2Enabled({ preference: false, preferencesLoaded: true })).toBe(false);
+    expect(resolveThreadListV2Enabled({ preference: true, preferencesLoaded: true })).toBe(true);
+  });
+
+  it("holds the default while preferences are still loading so the list does not remount", () => {
+    expect(resolveThreadListV2Enabled({ preference: undefined, preferencesLoaded: false })).toBe(
+      true,
+    );
+  });
+});
 
 describe("resolveThreadListV2Status", () => {
   it("prioritizes approval over a running session", () => {
