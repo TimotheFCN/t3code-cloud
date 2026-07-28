@@ -39,6 +39,26 @@ describe("protocol envelope", () => {
         { kind: "event", type: "heartbeat", payload: capacity },
         { kind: "res", id: "r1", ok: true, payload: { pong: true } },
         { kind: "res", id: "r2", ok: false, error: { code: "driver-error", message: "boom" } },
+        {
+          kind: "res",
+          id: "r3",
+          ok: true,
+          payload: {
+            id: "env-1",
+            name: "one",
+            image: "t3env:test",
+            state: "running",
+            containerId: "abc",
+            volumeName: "t3env-env-1-home",
+            ports: [{ containerPort: 3773, hostPort: 32768 }],
+          },
+        },
+        {
+          kind: "res",
+          id: "r4",
+          ok: true,
+          payload: { exitCode: 3, stdout: "out", stderr: "err" },
+        },
       ];
       for (const message of messages) {
         const wire = yield* encodeAgentToController(message);
@@ -61,6 +81,34 @@ describe("protocol envelope", () => {
         { kind: "rejected", reason: "protocol-mismatch", message: "nope" },
         { kind: "req", id: "r1", type: "ping" },
         { kind: "req", id: "r2", type: "list-environments" },
+        { kind: "req", id: "r3", type: "pull-image", payload: { reference: "t3env:0.1.0" } },
+        {
+          kind: "req",
+          id: "r4",
+          type: "create-environment",
+          payload: {
+            id: "env-1",
+            name: "one",
+            image: "t3env:0.1.0",
+            env: { T3CODE_PORT: "3773" },
+            publishPorts: [{ containerPort: 3773 }],
+          },
+        },
+        { kind: "req", id: "r5", type: "start-environment", payload: { environmentId: "env-1" } },
+        { kind: "req", id: "r6", type: "stop-environment", payload: { environmentId: "env-1" } },
+        {
+          kind: "req",
+          id: "r7",
+          type: "destroy-environment",
+          payload: { environmentId: "env-1" },
+        },
+        {
+          kind: "req",
+          id: "r8",
+          type: "exec-environment",
+          payload: { environmentId: "env-1", command: ["echo", "hello"] },
+        },
+        { kind: "req", id: "r9", type: "snapshot-volume", payload: { environmentId: "env-1" } },
       ];
       for (const message of messages) {
         const wire = yield* encodeControllerToAgent(message);

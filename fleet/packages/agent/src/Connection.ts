@@ -4,6 +4,7 @@ import {
   type AgentToController,
   type ControllerRequest,
   decodeControllerToAgent,
+  type DestroyEnvironmentPayload,
   encodeAgentToController,
   type ListEnvironmentsPayload,
   PROTOCOL_VERSION,
@@ -19,7 +20,7 @@ import * as Socket from "effect/unstable/socket/Socket";
 
 import { AgentConfig } from "./Config.ts";
 import { CredentialStore } from "./CredentialStore.ts";
-import { Driver } from "./driver/Driver.ts";
+import { Driver, type DriverError, type EnvironmentNotFoundError } from "./driver/Driver.ts";
 import * as Heartbeat from "./Heartbeat.ts";
 
 /** The controller refused the handshake; retrying cannot help. */
@@ -118,6 +119,37 @@ export const run = Effect.gen(function* () {
         Effect.repeat(Schedule.spaced(Duration.millis(intervalMillis))),
       );
 
+    /**
+     * Runs a driver operation and answers the request: success payload on
+     * `ok`, typed error codes for the two driver failure modes.
+     */
+    const respondDriver = <A>(
+      requestId: string,
+      operation: Effect.Effect<A, DriverError | EnvironmentNotFoundError>,
+    ) =>
+      operation.pipe(
+        Effect.flatMap((payload) => write({ kind: "res", id: requestId, ok: true, payload })),
+        Effect.catchTag("DriverError", (error) =>
+          write({
+            kind: "res",
+            id: requestId,
+            ok: false,
+            error: { code: "driver-error", message: error.message },
+          }),
+        ),
+        Effect.catchTag("EnvironmentNotFoundError", (error) =>
+          write({
+            kind: "res",
+            id: requestId,
+            ok: false,
+            error: {
+              code: "environment-not-found",
+              message: `environment ${error.environmentId} not found on this node`,
+            },
+          }),
+        ),
+      );
+
     const respond = (request: ControllerRequest) =>
       Effect.gen(function* () {
         switch (request.type) {
@@ -126,19 +158,49 @@ export const run = Effect.gen(function* () {
             return yield* write({ kind: "res", id: request.id, ok: true, payload });
           }
           case "list-environments": {
-            return yield* driver.listEnvironments.pipe(
-              Effect.flatMap((environments) => {
-                const payload: ListEnvironmentsPayload = { environments };
-                return write({ kind: "res", id: request.id, ok: true, payload });
-              }),
-              Effect.catchTag("DriverError", (error) =>
-                write({
-                  kind: "res",
-                  id: request.id,
-                  ok: false,
-                  error: { code: "driver-error", message: error.message },
-                }),
+            return yield* respondDriver(
+              request.id,
+              driver.listEnvironments.pipe(
+                Effect.map((environments): ListEnvironmentsPayload => ({ environments })),
               ),
+            );
+          }
+          case "pull-image": {
+            return yield* respondDriver(request.id, driver.pullImage(request.payload.reference));
+          }
+          case "create-environment": {
+            return yield* respondDriver(request.id, driver.createEnvironment(request.payload));
+          }
+          case "start-environment": {
+            return yield* respondDriver(
+              request.id,
+              driver.startEnvironment(request.payload.environmentId),
+            );
+          }
+          case "stop-environment": {
+            return yield* respondDriver(
+              request.id,
+              driver.stopEnvironment(request.payload.environmentId),
+            );
+          }
+          case "destroy-environment": {
+            return yield* respondDriver(
+              request.id,
+              driver
+                .destroyEnvironment(request.payload.environmentId)
+                .pipe(Effect.map((): DestroyEnvironmentPayload => ({ destroyed: true }))),
+            );
+          }
+          case "exec-environment": {
+            return yield* respondDriver(
+              request.id,
+              driver.execInEnvironment(request.payload.environmentId, request.payload.command),
+            );
+          }
+          case "snapshot-volume": {
+            return yield* respondDriver(
+              request.id,
+              driver.snapshotVolume(request.payload.environmentId),
             );
           }
         }

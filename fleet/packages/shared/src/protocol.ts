@@ -1,7 +1,13 @@
 import * as Schema from "effect/Schema";
 
 import { CapacitySnapshot } from "./capacity.ts";
-import { EnvironmentDescriptor } from "./environment.ts";
+import {
+  CreateEnvironmentSpec,
+  EnvironmentDescriptor,
+  ExecResult,
+  PulledImage,
+  VolumeSnapshot,
+} from "./environment.ts";
 
 /**
  * Controller <-> agent WebSocket protocol.
@@ -89,8 +95,88 @@ export const ListEnvironmentsRequest = Schema.Struct({
 });
 export type ListEnvironmentsRequest = typeof ListEnvironmentsRequest.Type;
 
-export const ControllerRequest = Schema.Union([PingRequest, ListEnvironmentsRequest]);
+// Driver commands (phase 2). Each request carries a typed payload; the
+// response payload schema for each type is listed below the envelope.
+
+export const PullImageRequest = Schema.Struct({
+  kind: Schema.Literal("req"),
+  id: Schema.String,
+  type: Schema.Literal("pull-image"),
+  payload: Schema.Struct({ reference: Schema.String }),
+});
+export type PullImageRequest = typeof PullImageRequest.Type;
+
+export const CreateEnvironmentRequest = Schema.Struct({
+  kind: Schema.Literal("req"),
+  id: Schema.String,
+  type: Schema.Literal("create-environment"),
+  payload: CreateEnvironmentSpec,
+});
+export type CreateEnvironmentRequest = typeof CreateEnvironmentRequest.Type;
+
+export const StartEnvironmentRequest = Schema.Struct({
+  kind: Schema.Literal("req"),
+  id: Schema.String,
+  type: Schema.Literal("start-environment"),
+  payload: Schema.Struct({ environmentId: Schema.String }),
+});
+export type StartEnvironmentRequest = typeof StartEnvironmentRequest.Type;
+
+export const StopEnvironmentRequest = Schema.Struct({
+  kind: Schema.Literal("req"),
+  id: Schema.String,
+  type: Schema.Literal("stop-environment"),
+  payload: Schema.Struct({ environmentId: Schema.String }),
+});
+export type StopEnvironmentRequest = typeof StopEnvironmentRequest.Type;
+
+export const DestroyEnvironmentRequest = Schema.Struct({
+  kind: Schema.Literal("req"),
+  id: Schema.String,
+  type: Schema.Literal("destroy-environment"),
+  payload: Schema.Struct({ environmentId: Schema.String }),
+});
+export type DestroyEnvironmentRequest = typeof DestroyEnvironmentRequest.Type;
+
+export const ExecEnvironmentRequest = Schema.Struct({
+  kind: Schema.Literal("req"),
+  id: Schema.String,
+  type: Schema.Literal("exec-environment"),
+  payload: Schema.Struct({
+    environmentId: Schema.String,
+    command: Schema.Array(Schema.String),
+  }),
+});
+export type ExecEnvironmentRequest = typeof ExecEnvironmentRequest.Type;
+
+export const SnapshotVolumeRequest = Schema.Struct({
+  kind: Schema.Literal("req"),
+  id: Schema.String,
+  type: Schema.Literal("snapshot-volume"),
+  payload: Schema.Struct({ environmentId: Schema.String }),
+});
+export type SnapshotVolumeRequest = typeof SnapshotVolumeRequest.Type;
+
+export const ControllerRequest = Schema.Union([
+  PingRequest,
+  ListEnvironmentsRequest,
+  PullImageRequest,
+  CreateEnvironmentRequest,
+  StartEnvironmentRequest,
+  StopEnvironmentRequest,
+  DestroyEnvironmentRequest,
+  ExecEnvironmentRequest,
+  SnapshotVolumeRequest,
+]);
 export type ControllerRequest = typeof ControllerRequest.Type;
+
+/**
+ * A request without its envelope fields — what callers of
+ * `AgentConnections.request` supply; the correlation `id` is generated there.
+ */
+export type ControllerRequestBody = {
+  [K in ControllerRequest["type"]]: Omit<Extract<ControllerRequest, { type: K }>, "kind" | "id">;
+}[ControllerRequest["type"]];
 
 /**
  * Response payloads are `Unknown` in the envelope; the requesting side decodes
@@ -128,6 +214,23 @@ export const ListEnvironmentsPayload = Schema.Struct({
   environments: Schema.Array(EnvironmentDescriptor),
 });
 export type ListEnvironmentsPayload = typeof ListEnvironmentsPayload.Type;
+
+export const PullImagePayload = PulledImage;
+export type PullImagePayload = typeof PullImagePayload.Type;
+
+export const EnvironmentPayload = EnvironmentDescriptor;
+export type EnvironmentPayload = typeof EnvironmentPayload.Type;
+
+export const DestroyEnvironmentPayload = Schema.Struct({
+  destroyed: Schema.Literal(true),
+});
+export type DestroyEnvironmentPayload = typeof DestroyEnvironmentPayload.Type;
+
+export const ExecEnvironmentPayload = ExecResult;
+export type ExecEnvironmentPayload = typeof ExecEnvironmentPayload.Type;
+
+export const SnapshotVolumePayload = VolumeSnapshot;
+export type SnapshotVolumePayload = typeof SnapshotVolumePayload.Type;
 
 // --- wire unions -------------------------------------------------------------
 

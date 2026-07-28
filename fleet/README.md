@@ -10,11 +10,12 @@ the `t3` CLI and its HTTP APIs.
 
 ## Packages
 
-| Package               | Role                                                                                     |
-| --------------------- | ---------------------------------------------------------------------------------------- |
-| `packages/controller` | Control plane: HTTP API, agent WebSocket endpoint, SQLite persistence, node inventory    |
-| `packages/agent`      | Per-node daemon: joins the controller, heartbeats, hosts the environment driver          |
-| `packages/shared`     | Protocol schemas (message envelope, node/capacity/environment types) shared by all sides |
+| Package               | Role                                                                                               |
+| --------------------- | -------------------------------------------------------------------------------------------------- |
+| `packages/controller` | Control plane: HTTP API, agent WebSocket endpoint, SQLite persistence, nodes + image registry      |
+| `packages/agent`      | Per-node daemon: joins the controller, heartbeats, runs the docker/sysbox environment driver       |
+| `packages/shared`     | Protocol schemas (message envelope, node/capacity/environment/image types) shared by all sides     |
+| `image/`              | The `t3env` base image: Dockerfile (pinned ARGs), entrypoint, build script — see `image/README.md` |
 
 Stack: TypeScript + Effect v4, Node >= 24 (sources run directly via Node's native type
 stripping — no build step), SQLite via `node:sqlite` (`@effect/sql-sqlite-node`).
@@ -63,17 +64,38 @@ Controller — file path from `FLEET_CONTROLLER_CONFIG`; keys `host`, `port`, `d
 `FLEET_CONTROLLER_JOIN_TOKEN_TTL_SECONDS`.
 
 Agent — file path from `FLEET_AGENT_CONFIG`; keys `controllerUrl`, `nodeName`, `stateDir`,
-`joinToken`; env equivalents `FLEET_AGENT_CONTROLLER_URL`, `FLEET_AGENT_NODE_NAME`,
-`FLEET_AGENT_STATE_DIR`, `FLEET_AGENT_JOIN_TOKEN`.
+`joinToken`, `dockerRuntime`, `snapshotRetention`, `helperImage`; env equivalents
+`FLEET_AGENT_CONTROLLER_URL`, `FLEET_AGENT_NODE_NAME`, `FLEET_AGENT_STATE_DIR`,
+`FLEET_AGENT_JOIN_TOKEN`, `FLEET_AGENT_DOCKER_RUNTIME`, `FLEET_AGENT_SNAPSHOT_RETENTION`,
+`FLEET_AGENT_HELPER_IMAGE`.
 
 The controller is the only stateful component (SQLite under `dataDir`, forward-only migrations
-applied at start). The agent's only local state is `<stateDir>/credential.json` (mode 0600).
+applied at start). The agent's local state is `<stateDir>/credential.json` (mode 0600) plus
+volume snapshot tarballs under `<stateDir>/snapshots/<envId>/`.
 
-## HTTP API (phase 1)
+## The docker driver
 
-| Endpoint                | Description                                              |
-| ----------------------- | -------------------------------------------------------- |
-| `GET /healthz`          | Liveness                                                 |
-| `GET /api/nodes`        | Node inventory with derived health and live capacity     |
-| `POST /api/join-tokens` | Mint a single-use join token (`{ "ttlSeconds"?: n }`)    |
-| `GET /ws/agent`         | Agent WebSocket endpoint (protocol in `packages/shared`) |
+The agent runs environments as Docker containers under the **sysbox** runtime
+(`dockerRuntime: "sysbox-runc"` by default) so each one gets a working inner Docker daemon
+without `--privileged`. When the runtime is missing the driver fails with a diagnostic — it never
+falls back to a privileged container; setting `FLEET_AGENT_DOCKER_RUNTIME=runc` is an explicit,
+unsupported opt-out used by tests and development.
+
+The driver is stateless: containers and volumes carry `t3fleet.*` labels
+(`t3fleet.environment-id`, ...) and every read derives from them, so an agent restart re-adopts
+running environments without any bookkeeping. One named volume per environment
+(`t3env-<id>-home`) mounts at `/root` — the durability contract is documented in
+`image/README.md`.
+
+## HTTP API (phases 1–2)
+
+| Endpoint                       | Description                                                       |
+| ------------------------------ | ----------------------------------------------------------------- |
+| `GET /healthz`                 | Liveness                                                          |
+| `GET /api/nodes`               | Node inventory with derived health and live capacity              |
+| `POST /api/join-tokens`        | Mint a single-use join token (`{ "ttlSeconds"?: n }`)             |
+| `GET /api/images`              | Registered base images                                            |
+| `POST /api/images`             | Register an image reference (`{ "reference": "t3env:0.1.0" }`)    |
+| `POST /api/images/:id/current` | Make an image the one new environments use                        |
+| `POST /api/images/:id/pull`    | Pull on one node (`{ "nodeId"?: "..." }`) or every connected node |
+| `GET /ws/agent`                | Agent WebSocket endpoint (protocol in `packages/shared`)          |

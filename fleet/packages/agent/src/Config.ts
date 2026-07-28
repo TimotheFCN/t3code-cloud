@@ -23,9 +23,23 @@ export interface AgentConfigShape {
   /** Controller origin, e.g. `ws://127.0.0.1:9400` or `http://fleet:9400`. */
   readonly controllerUrl: string;
   readonly nodeName: string;
-  /** Holds the credential file; also the disk sampled for capacity snapshots. */
+  /**
+   * Holds the credential file and volume snapshots; also the disk sampled
+   * for capacity snapshots.
+   */
   readonly stateDir: string;
   readonly joinToken: Option.Option<Redacted.Redacted<string>>;
+  /**
+   * Container runtime for environment containers. Defaults to `sysbox-runc`
+   * — the only supported production runtime (inner Docker without
+   * `--privileged`). The docker driver fails loudly when it is missing; a
+   * different value here is an explicit, unsupported opt-out for tests.
+   */
+  readonly dockerRuntime: string;
+  /** Snapshot tarballs kept per environment before the oldest are pruned. */
+  readonly snapshotRetention: number;
+  /** Image used for the helper containers that tar/untar volumes. */
+  readonly helperImage: string;
 }
 
 const ConfigFile = Schema.Struct({
@@ -33,7 +47,17 @@ const ConfigFile = Schema.Struct({
   nodeName: Schema.optional(Schema.String),
   stateDir: Schema.optional(Schema.String),
   joinToken: Schema.optional(Schema.String),
+  dockerRuntime: Schema.optional(Schema.String),
+  snapshotRetention: Schema.optional(Schema.Int),
+  helperImage: Schema.optional(Schema.String),
 });
+
+export const defaults = {
+  stateDir: "./.data/agent",
+  dockerRuntime: "sysbox-runc",
+  snapshotRetention: 5,
+  helperImage: "alpine:3.22",
+} as const;
 
 const decodeConfigFile = Schema.decodeUnknownEffect(Schema.fromJsonString(ConfigFile));
 
@@ -73,6 +97,9 @@ export class AgentConfig extends Context.Service<AgentConfig, AgentConfigShape>(
         nodeName: yield* Config.string("FLEET_AGENT_NODE_NAME").pipe(Config.option),
         stateDir: yield* Config.string("FLEET_AGENT_STATE_DIR").pipe(Config.option),
         joinToken: yield* Config.redacted("FLEET_AGENT_JOIN_TOKEN").pipe(Config.option),
+        dockerRuntime: yield* Config.string("FLEET_AGENT_DOCKER_RUNTIME").pipe(Config.option),
+        snapshotRetention: yield* Config.int("FLEET_AGENT_SNAPSHOT_RETENTION").pipe(Config.option),
+        helperImage: yield* Config.string("FLEET_AGENT_HELPER_IMAGE").pipe(Config.option),
       };
       const controllerUrl = Option.getOrElse(env.controllerUrl, () => fromFile.controllerUrl ?? "");
       if (controllerUrl === "") {
@@ -84,11 +111,23 @@ export class AgentConfig extends Context.Service<AgentConfig, AgentConfigShape>(
       return AgentConfig.of({
         controllerUrl,
         nodeName: Option.getOrElse(env.nodeName, () => fromFile.nodeName ?? NodeOs.hostname()),
-        stateDir: Option.getOrElse(env.stateDir, () => fromFile.stateDir ?? "./.data/agent"),
+        stateDir: Option.getOrElse(env.stateDir, () => fromFile.stateDir ?? defaults.stateDir),
         joinToken: Option.orElse(env.joinToken, () =>
           fromFile.joinToken === undefined
             ? Option.none()
             : Option.some(Redacted.make(fromFile.joinToken)),
+        ),
+        dockerRuntime: Option.getOrElse(
+          env.dockerRuntime,
+          () => fromFile.dockerRuntime ?? defaults.dockerRuntime,
+        ),
+        snapshotRetention: Option.getOrElse(
+          env.snapshotRetention,
+          () => fromFile.snapshotRetention ?? defaults.snapshotRetention,
+        ),
+        helperImage: Option.getOrElse(
+          env.helperImage,
+          () => fromFile.helperImage ?? defaults.helperImage,
         ),
       });
     }),

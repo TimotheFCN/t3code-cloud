@@ -7,7 +7,8 @@
     "./protocol": "./src/protocol.ts",
     "./node": "./src/node.ts",
     "./capacity": "./src/capacity.ts",
-    "./environment": "./src/environment.ts"
+    "./environment": "./src/environment.ts",
+    "./image": "./src/image.ts"
   },
   "dependencies": {
     "effect": "4.0.0-beta.102"

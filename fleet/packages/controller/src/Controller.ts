@@ -10,6 +10,8 @@ import * as Database from "./db/Database.ts";
 import { Events } from "./events/Events.ts";
 import * as Api from "./http/Api.ts";
 import * as AgentSocket from "./http/AgentSocket.ts";
+import { ImagePulls } from "./images/ImagePulls.ts";
+import { Images } from "./images/Images.ts";
 import { AgentConnections } from "./nodes/AgentConnections.ts";
 import { JoinTokens } from "./nodes/JoinTokens.ts";
 import { NodeRegistry } from "./nodes/NodeRegistry.ts";
@@ -21,7 +23,8 @@ export const Routes = Layer.mergeAll(Api.layer, AgentSocket.layer);
  * Controller domain services. Requires `SqlClient` and `ControllerConfig`;
  * exposes every service so tests and the composed server share one wiring.
  */
-export const Services = NodeRegistry.layer.pipe(
+export const Services = ImagePulls.layer.pipe(
+  Layer.provideMerge(Layer.mergeAll(NodeRegistry.layer, Images.layer)),
   Layer.provideMerge(Layer.mergeAll(JoinTokens.layer, Events.layer, AgentConnections.layer)),
 );
 

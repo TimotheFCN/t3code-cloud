@@ -6,7 +6,7 @@ import * as NodePath from "node:path";
 import * as NodeHttpServer from "@effect/platform-node/NodeHttpServer";
 import * as NodeSocket from "@effect/platform-node/NodeSocket";
 import { describe, expect, it } from "@effect/vitest";
-import { AgentConfig } from "@t3fleet/agent/Config";
+import { AgentConfig, defaults as agentDefaults } from "@t3fleet/agent/Config";
 import * as Connection from "@t3fleet/agent/Connection";
 import { CredentialStore } from "@t3fleet/agent/CredentialStore";
 import * as FakeDriver from "@t3fleet/agent/driver/FakeDriver";
@@ -15,6 +15,8 @@ import {
   AGENT_SOCKET_PATH,
   decodeControllerToAgent,
   encodeAgentToController,
+  EnvironmentPayload,
+  ExecEnvironmentPayload,
   ListEnvironmentsPayload,
   PongPayload,
   PROTOCOL_VERSION,
@@ -34,6 +36,8 @@ import * as Socket from "effect/unstable/socket/Socket";
 import { ControllerConfig, type ControllerConfigShape } from "../Config.ts";
 import * as Controller from "../Controller.ts";
 import * as Database from "../db/Database.ts";
+import { ImagePulls } from "../images/ImagePulls.ts";
+import { Images } from "../images/Images.ts";
 import { AgentConnections } from "../nodes/AgentConnections.ts";
 import { JoinTokens } from "../nodes/JoinTokens.ts";
 import { NodeRegistry } from "../nodes/NodeRegistry.ts";
@@ -98,6 +102,9 @@ const runAgent = (options: { readonly stateDir: string; readonly joinToken?: str
             options.joinToken === undefined
               ? Option.none()
               : Option.some(Redacted.make(options.joinToken)),
+          dockerRuntime: agentDefaults.dockerRuntime,
+          snapshotRetention: agentDefaults.snapshotRetention,
+          helperImage: agentDefaults.helperImage,
         }),
       ),
     );
@@ -145,6 +152,8 @@ const helloFrame = (input: {
 
 const decodePong = Schema.decodeUnknownEffect(PongPayload);
 const decodeEnvironments = Schema.decodeUnknownEffect(ListEnvironmentsPayload);
+const decodeEnvironment = Schema.decodeUnknownEffect(EnvironmentPayload);
+const decodeExec = Schema.decodeUnknownEffect(ExecEnvironmentPayload);
 
 describe("agent <-> controller integration", () => {
   it.live("token join registers the node, heartbeats, and serves requests", () =>
@@ -171,11 +180,78 @@ describe("agent <-> controller integration", () => {
 
       // Correlation-id request/response over the live socket.
       const connections = yield* AgentConnections;
-      const pong = yield* decodePong(yield* connections.request(node.id, "ping"));
+      const pong = yield* decodePong(yield* connections.request(node.id, { type: "ping" }));
       expect(pong.pong).toBe(true);
 
       const environments = yield* decodeEnvironments(
-        yield* connections.request(node.id, "list-environments"),
+        yield* connections.request(node.id, { type: "list-environments" }),
+      );
+      expect(environments.environments).toEqual([]);
+    }).pipe(Effect.scoped, Effect.provide(ControllerTestLayer)),
+  );
+
+  it.live("drives driver commands and image pulls over the wire", () =>
+    Effect.gen(function* () {
+      const token = yield* mintToken;
+      const stateDir = yield* tempStateDir;
+      yield* runAgent({ stateDir, joinToken: token });
+      const nodes = yield* awaitNodes((all) => all.length === 1 && all[0]!.connected);
+      const nodeId = nodes[0]!.id;
+      const connections = yield* AgentConnections;
+
+      // Environment lifecycle through the request/response machinery
+      // (FakeDriver behind the agent — the real-Docker path is covered by
+      // DockerDriver.test.ts).
+      const created = yield* decodeEnvironment(
+        yield* connections.request(nodeId, {
+          type: "create-environment",
+          payload: { id: "env-wire", name: "wire", image: "t3env:test" },
+        }),
+      );
+      expect(created.state).toBe("created");
+
+      const started = yield* decodeEnvironment(
+        yield* connections.request(nodeId, {
+          type: "start-environment",
+          payload: { environmentId: "env-wire" },
+        }),
+      );
+      expect(started.state).toBe("running");
+
+      const exec = yield* decodeExec(
+        yield* connections.request(nodeId, {
+          type: "exec-environment",
+          payload: { environmentId: "env-wire", command: ["echo", "hello"] },
+        }),
+      );
+      expect(exec.exitCode).toBe(0);
+      expect(exec.stdout).toContain("echo hello");
+
+      // Driver failures surface as typed request errors.
+      const failure = yield* connections
+        .request(nodeId, { type: "start-environment", payload: { environmentId: "missing" } })
+        .pipe(Effect.flip);
+      expect(failure).toMatchObject({
+        _tag: "AgentRequestError",
+        code: "environment-not-found",
+      });
+
+      // Image registry + pull orchestration records the reported digest.
+      const images = yield* Images;
+      const pulls = yield* ImagePulls;
+      const image = yield* images.register({ reference: "t3env:test" });
+      const results = yield* pulls.pull({ imageId: image.id });
+      expect(results).toHaveLength(1);
+      expect(results[0]).toMatchObject({ nodeId, ok: true });
+      const pulled = yield* images.get(image.id);
+      expect(pulled.digest).toContain("sha256:");
+
+      yield* connections.request(nodeId, {
+        type: "destroy-environment",
+        payload: { environmentId: "env-wire" },
+      });
+      const environments = yield* decodeEnvironments(
+        yield* connections.request(nodeId, { type: "list-environments" }),
       );
       expect(environments.environments).toEqual([]);
     }).pipe(Effect.scoped, Effect.provide(ControllerTestLayer)),

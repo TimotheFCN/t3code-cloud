@@ -1,13 +1,19 @@
-import type { EnvironmentDescriptor, EnvironmentState } from "@t3fleet/shared/environment";
+import type {
+  CreateEnvironmentSpec,
+  EnvironmentDescriptor,
+  EnvironmentState,
+} from "@t3fleet/shared/environment";
+import * as Clock from "effect/Clock";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 
-import { Driver, EnvironmentNotFoundError, type CreateEnvironmentInput } from "./Driver.ts";
+import { Driver, DriverError, EnvironmentNotFoundError } from "./Driver.ts";
 
 /**
- * In-memory driver used by tests (and as the placeholder wiring until the
- * phase-2 docker driver lands). State transitions mirror what the docker
- * driver will report: created -> running -> stopped, destroy removes.
+ * In-memory driver used by tests (and as placeholder wiring where no Docker
+ * daemon exists). Mirrors the docker driver's contract: created -> running ->
+ * stopped, destroy removes, create adopts an existing id, restore requires a
+ * stopped environment.
  */
 export const layer = Layer.sync(Driver)(() => {
   const environments = new Map<string, { name: string; image: string; state: EnvironmentState }>();
@@ -25,11 +31,16 @@ export const layer = Layer.sync(Driver)(() => {
     });
 
   return Driver.of({
+    pullImage: Effect.fn("FakeDriver.pullImage")(function* (reference: string) {
+      return { reference, digest: `${reference}@sha256:${"0".repeat(64)}` };
+    }),
     createEnvironment: Effect.fn("FakeDriver.createEnvironment")(function* (
-      input: CreateEnvironmentInput,
+      spec: CreateEnvironmentSpec,
     ) {
-      environments.set(input.id, { name: input.name, image: input.image, state: "created" });
-      return descriptor(input.id);
+      if (!environments.has(spec.id)) {
+        environments.set(spec.id, { name: spec.name, image: spec.image, state: "created" });
+      }
+      return descriptor(spec.id);
     }),
     startEnvironment: Effect.fn("FakeDriver.startEnvironment")(function* (environmentId: string) {
       yield* require("startEnvironment")(environmentId);
@@ -54,12 +65,26 @@ export const layer = Layer.sync(Driver)(() => {
       yield* require("execInEnvironment")(environmentId);
       return { exitCode: 0, stdout: `fake-exec: ${command.join(" ")}`, stderr: "" };
     }),
-    snapshotVolume: Effect.fn("FakeDriver.snapshotVolume")(function* (
-      environmentId: string,
-      destinationPath: string,
-    ) {
+    snapshotVolume: Effect.fn("FakeDriver.snapshotVolume")(function* (environmentId: string) {
       yield* require("snapshotVolume")(environmentId);
-      return { path: destinationPath };
+      const now = yield* Clock.currentTimeMillis;
+      return {
+        path: `/fake/snapshots/${environmentId}/${now}.tar.gz`,
+        createdAtMillis: now,
+        sizeBytes: 0,
+      };
+    }),
+    restoreVolume: Effect.fn("FakeDriver.restoreVolume")(function* (
+      environmentId: string,
+      snapshotPath: string,
+    ) {
+      yield* require("restoreVolume")(environmentId);
+      if (environments.get(environmentId)!.state === "running") {
+        return yield* new DriverError({
+          operation: "restoreVolume",
+          message: `environment ${environmentId} must be stopped before restoring ${snapshotPath}`,
+        });
+      }
     }),
     listEnvironments: Effect.sync(() => [...environments.keys()].map((id) => descriptor(id))),
   });

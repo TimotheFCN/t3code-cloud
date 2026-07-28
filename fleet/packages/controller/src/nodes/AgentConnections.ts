@@ -1,8 +1,14 @@
 import * as NodeCrypto from "node:crypto";
 
-import type { AgentResponse, ControllerRequest, ControllerToAgent } from "@t3fleet/shared/protocol";
+import type {
+  AgentResponse,
+  ControllerRequest,
+  ControllerRequestBody,
+  ControllerToAgent,
+} from "@t3fleet/shared/protocol";
 import * as Context from "effect/Context";
 import * as Deferred from "effect/Deferred";
+import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
@@ -52,7 +58,8 @@ export class AgentConnections extends Context.Service<
     readonly handleResponse: (nodeId: string, response: AgentResponse) => Effect.Effect<void>;
     readonly request: (
       nodeId: string,
-      requestType: ControllerRequest["type"],
+      body: ControllerRequestBody,
+      options?: { readonly timeout?: Duration.Input },
     ) => Effect.Effect<
       unknown,
       NodeNotConnectedError | AgentRequestError | AgentRequestTimeoutError
@@ -107,7 +114,8 @@ export class AgentConnections extends Context.Service<
 
     const request = Effect.fn("AgentConnections.request")(function* (
       nodeId: string,
-      requestType: ControllerRequest["type"],
+      body: ControllerRequestBody,
+      options?: { readonly timeout?: Duration.Input },
     ) {
       const connection = connections.get(nodeId);
       if (connection === undefined) {
@@ -116,13 +124,15 @@ export class AgentConnections extends Context.Service<
       const requestId = NodeCrypto.randomUUID();
       const deferred = yield* Deferred.make<unknown, AgentRequestError>();
       connection.pending.set(requestId, deferred);
-      yield* connection.write({ kind: "req", id: requestId, type: requestType });
+      yield* connection.write({ kind: "req", id: requestId, ...body } as ControllerRequest);
       return yield* Deferred.await(deferred).pipe(
         Effect.timeoutOrElse({
-          duration: "10 seconds",
+          // Driver commands (image pulls, stops, snapshots) can legitimately
+          // take minutes; callers set a timeout fitting the operation.
+          duration: options?.timeout ?? Duration.seconds(10),
           orElse: () =>
             Effect.sync(() => connection.pending.delete(requestId)).pipe(
-              Effect.andThen(new AgentRequestTimeoutError({ nodeId, requestType })),
+              Effect.andThen(new AgentRequestTimeoutError({ nodeId, requestType: body.type })),
             ),
         }),
         Effect.onInterrupt(() => Effect.sync(() => connection.pending.delete(requestId))),

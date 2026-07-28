@@ -9,6 +9,7 @@
     "./CredentialStore": "./src/CredentialStore.ts",
     "./Heartbeat": "./src/Heartbeat.ts",
     "./driver/Driver": "./src/driver/Driver.ts",
+    "./driver/DockerDriver": "./src/driver/DockerDriver.ts",
     "./driver/FakeDriver": "./src/driver/FakeDriver.ts"
   },
   "dependencies": {

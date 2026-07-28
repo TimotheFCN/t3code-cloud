@@ -23,12 +23,13 @@ const countApplied = Effect.gen(function* () {
 });
 
 describe("Migrator", () => {
-  it.effect("creates the phase-1 schema", () =>
+  it.effect("creates the schema", () =>
     Effect.gen(function* () {
       const tables = yield* listTables;
       expect(tables).toContain("nodes");
       expect(tables).toContain("join_tokens");
       expect(tables).toContain("events");
+      expect(tables).toContain("images");
       expect(tables).toContain("migrations");
     }).pipe(Effect.provide(Database.layerMemory)),
   );
@@ -46,8 +47,8 @@ describe("Migrator", () => {
       // everything already applied.
       const second = yield* countApplied.pipe(Effect.provide(Database.layer({ filename })));
 
-      expect(first).toBe(1);
-      expect(second).toBe(1);
+      expect(first).toBeGreaterThanOrEqual(2);
+      expect(second).toBe(first);
 
       yield* Effect.promise(() => NodeFs.rm(dir, { recursive: true, force: true }));
     }),
